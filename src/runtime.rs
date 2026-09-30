@@ -1210,6 +1210,12 @@ fn eval(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Object> {
                 && op(&n["func"]["value"]) == "Name"
                 && s(&n["func"]["value"], "id") == "inspect"
                 && let Ok(native) = args[0].bind(py).cast::<EngineFunction>()
+                // Honor application replacements of the inspection callbacks.
+                // Only adapt the original stdlib function classification for
+                // our native descriptors, whose Python bytecode is excluded.
+                && callable.bind(py).get_type().is(py.import("types")?.getattr("FunctionType")?)
+                && callable.bind(py).getattr("__globals__")?.is(py.import("inspect")?.dict())
+                && callable.bind(py).getattr("__code__")?.getattr("co_name")?.extract::<String>()? == s(&n["func"], "attr")
             {
                 let bound = native.borrow().receiver.is_some();
                 let value = match s(&n["func"], "attr") {

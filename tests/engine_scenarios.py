@@ -388,4 +388,10 @@ try:
 except ValueError as error:
     results['unpack-iterator-effects'] = [str(error), unpack_events]
 
+from rest_framework.fields import is_simple_callable
+with patch.object(inspect, 'isfunction', return_value=False) as function_hook, \
+        patch.object(inspect, 'ismethod', return_value=False) as method_hook:
+    result = is_simple_callable(serializers.Field.bind)
+    results['inspection-callback-hooks'] = [result, function_hook.call_count, method_hook.call_count]
+
 print(json.dumps(results, sort_keys=True, default=str))
