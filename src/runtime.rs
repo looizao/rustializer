@@ -1980,10 +1980,12 @@ impl EngineGenerator {
                 return Ok(());
             }
             generator.closed = true;
-            // 3.12 and 3.13 before 3.13.12 retain unstarted locals until
-            // deallocation; the later 3.13 patches explicitly clear the frame.
+            // Old 3.12 close shortcuts retain this simple loop's entire frame.
+            // Newer 3.12 and 3.13 before 3.13.12 retain only unstarted frames.
             let [minor, patch] = python_version();
-            if !generator.started && (minor == 12 || minor == 13 && patch < 12) {
+            if minor == 12 && patch < 5
+                || !generator.started && (minor == 12 || minor == 13 && patch < 12)
+            {
                 return Ok(());
             }
             generator.running = generator.started && matches!(python_minor(), 11 | 12);
