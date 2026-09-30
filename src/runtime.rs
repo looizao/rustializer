@@ -12,6 +12,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PySet, PyString, PyTuple, P
 use serde_json::Value;
 
 use crate::abi;
+mod fast;
 
 // Native handlers participate in Python's handled-exception state so callbacks
 // see the same sys.exc_info() and chained exceptions as reference callbacks.
@@ -120,7 +121,7 @@ struct Frame {
     locals: Py<PyDict>,
     closure: Option<Py<PyList>>,
     class_cell: Option<Py<PyList>>,
-    local_names: HashSet<String>,
+    local_names: Arc<HashSet<String>>,
     first: Option<Object>,
     exception: Option<PyErr>,
     in_class: bool,
@@ -132,7 +133,7 @@ impl Frame {
             locals: self.locals.bind(py).copy()?.unbind(),
             closure: self.closure.as_ref().map(|x| x.clone_ref(py)),
             class_cell: self.class_cell.as_ref().map(|x| x.clone_ref(py)),
-            local_names: HashSet::new(),
+            local_names: Arc::new(HashSet::new()),
             first: self.first.as_ref().map(|x| x.clone_ref(py)),
             exception: self.exception.as_ref().map(|x| x.clone_ref(py)),
             in_class: self.in_class,
@@ -181,6 +182,9 @@ impl Frame {
 #[pyclass(dict, weakref, module = "rustializer._native")]
 struct EngineFunction {
     node: Arc<Node>,
+    local_names: Arc<HashSet<String>>,
+    is_generator: bool,
+    plan: Option<fast::Plan>,
     globals: Option<Py<PyDict>>,
     closure: Option<Py<PyList>>,
     class_cell: Option<Py<PyList>>,
@@ -211,6 +215,9 @@ impl EngineFunction {
     fn copied(&self, py: Python<'_>, receiver: Option<Object>) -> Self {
         Self {
             node: self.node.clone(),
+            local_names: self.local_names.clone(),
+            is_generator: self.is_generator,
+            plan: self.plan.clone(),
             globals: self.globals.as_ref().map(|v| v.clone_ref(py)),
             closure: self.closure.as_ref().map(|v| v.clone_ref(py)),
             class_cell: self.class_cell.as_ref().map(|v| v.clone_ref(py)),
@@ -231,6 +238,36 @@ impl EngineFunction {
         args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Frame> {
+        let spec = &self.node["args"];
+        let positional_parameters = array(spec, "posonlyargs").iter().chain(array(spec, "args"));
+        // Exact positional calls cannot consult defaults or invoke keyword-key
+        // hooks. Keep the full binder for every other call and its error paths.
+        if self.receiver.is_none()
+            && kwargs.is_none_or(|values| values.is_empty())
+            && spec["vararg"].is_null()
+            && spec["kwarg"].is_null()
+            && array(spec, "kwonlyargs").is_empty()
+            && positional_parameters.clone().count() == args.len()
+        {
+            let locals = PyDict::new(py);
+            for (parameter, value) in positional_parameters.zip(args.iter()) {
+                locals.set_item(s(parameter, "arg"), value)?;
+            }
+            return Ok(Frame {
+                globals: self
+                    .globals
+                    .as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("cleared function"))?
+                    .clone_ref(py),
+                locals: locals.unbind(),
+                closure: self.closure.as_ref().map(|value| value.clone_ref(py)),
+                class_cell: self.class_cell.as_ref().map(|value| value.clone_ref(py)),
+                local_names: self.local_names.clone(),
+                first: args.iter().next().map(Bound::unbind),
+                exception: None,
+                in_class: false,
+            });
+        }
         let defaults: Vec<_> = self
             .defaults
             .as_ref()
@@ -246,7 +283,6 @@ impl EngineFunction {
             Some(v) => v.copy()?,
             None => PyDict::new(py),
         };
-        let spec = &self.node["args"];
         let names: Vec<&str> = array(spec, "posonlyargs")
             .iter()
             .chain(array(spec, "args"))
@@ -382,14 +418,12 @@ impl EngineFunction {
             .transpose()?
             .flatten()
             .map(Bound::unbind);
-        let mut local_names = HashSet::new();
-        collect_locals(&self.node, &mut local_names, true);
         Ok(Frame {
             globals,
             locals: locals.unbind(),
             closure: self.closure.as_ref().map(|v| v.clone_ref(py)),
             class_cell: self.class_cell.as_ref().map(|v| v.clone_ref(py)),
-            local_names,
+            local_names: self.local_names.clone(),
             first,
             exception: None,
             in_class: false,
@@ -424,7 +458,7 @@ impl EngineFunction {
             .borrow()
             .copied(py, slf.borrow().receiver.as_ref().map(|v| v.clone_ref(py)));
         let mut frame = function.bind(py, args, kwargs)?;
-        if contains_yield(&function.node, true) {
+        if function.is_generator {
             return Ok(Py::new(
                 py,
                 EngineGenerator {
@@ -441,6 +475,9 @@ impl EngineFunction {
             frame.globals.bind(py),
             function.node["line"].as_u64().unwrap_or(1) as u32,
         )?;
+        if let Some(plan) = &function.plan {
+            return plan.execute(py, &mut frame, &function.node);
+        }
         if op(&function.node) == "Lambda" {
             return eval(py, &mut frame, &function.node["body"]);
         }
@@ -829,10 +866,19 @@ fn function(py: Python<'_>, frame: &mut Frame, node: &Node, in_class: bool) -> P
         .bind(py)
         .get_item("__qualname__")?
         .and_then(|v| v.extract::<String>().ok());
+    let qualname = prefix
+        .map(|p| format!("{p}.{name}"))
+        .unwrap_or_else(|| name.clone());
+    let plan = fast::Plan::new(&module, &qualname, node);
+    let mut local_names = HashSet::new();
+    collect_locals(node, &mut local_names, true);
     Ok(Py::new(
         py,
         EngineFunction {
             node: Arc::new(node.clone()),
+            local_names: Arc::new(local_names),
+            is_generator: contains_yield(node, true),
+            plan,
             globals: Some(frame.globals.clone_ref(py)),
             closure: lexical_scope(py, frame, !in_class)?,
             class_cell: frame.class_cell.as_ref().map(|v| v.clone_ref(py)),
@@ -845,9 +891,7 @@ fn function(py: Python<'_>, frame: &mut Frame, node: &Node, in_class: bool) -> P
                 .first()
                 .filter(|v| op(v) == "Expr" && op(&v["value"]) == "Constant")
                 .and_then(|v| v["value"]["value"].as_str().map(str::to_owned)),
-            qualname: prefix
-                .map(|p| format!("{p}.{name}"))
-                .unwrap_or_else(|| name.clone()),
+            qualname,
             name,
             module,
         },
@@ -862,35 +906,54 @@ fn binary(
     right: &Object,
     inplace: bool,
 ) -> PyResult<Object> {
-    let name = match name {
-        "Add" => "add",
-        "Sub" => "sub",
-        "Mult" => "mul",
-        "Div" => "truediv",
-        "FloorDiv" => "floordiv",
-        "Mod" => "mod",
-        "Pow" => "pow",
-        "BitOr" => "or_",
-        "BitAnd" => "and_",
-        "BitXor" => "xor",
-        "LShift" => "lshift",
-        "RShift" => "rshift",
+    use pyo3::ffi;
+    let left = left.as_ptr();
+    let right = right.as_ptr();
+    if name == "Pow" {
+        let result = unsafe {
+            if inplace {
+                ffi::PyNumber_InPlacePower(left, right, py.None().as_ptr())
+            } else {
+                ffi::PyNumber_Power(left, right, py.None().as_ptr())
+            }
+        };
+        return unsafe { Bound::from_owned_ptr_or_err(py, result) }.map(Bound::unbind);
+    }
+    let operation: unsafe extern "C" fn(
+        *mut ffi::PyObject,
+        *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject = match (name, inplace) {
+        ("Add", false) => ffi::PyNumber_Add,
+        ("Add", true) => ffi::PyNumber_InPlaceAdd,
+        ("Sub", false) => ffi::PyNumber_Subtract,
+        ("Sub", true) => ffi::PyNumber_InPlaceSubtract,
+        ("Mult", false) => ffi::PyNumber_Multiply,
+        ("Mult", true) => ffi::PyNumber_InPlaceMultiply,
+        ("Div", false) => ffi::PyNumber_TrueDivide,
+        ("Div", true) => ffi::PyNumber_InPlaceTrueDivide,
+        ("FloorDiv", false) => ffi::PyNumber_FloorDivide,
+        ("FloorDiv", true) => ffi::PyNumber_InPlaceFloorDivide,
+        ("Mod", false) => ffi::PyNumber_Remainder,
+        ("Mod", true) => ffi::PyNumber_InPlaceRemainder,
+        ("BitOr", false) => ffi::PyNumber_Or,
+        ("BitOr", true) => ffi::PyNumber_InPlaceOr,
+        ("BitAnd", false) => ffi::PyNumber_And,
+        ("BitAnd", true) => ffi::PyNumber_InPlaceAnd,
+        ("BitXor", false) => ffi::PyNumber_Xor,
+        ("BitXor", true) => ffi::PyNumber_InPlaceXor,
+        ("LShift", false) => ffi::PyNumber_Lshift,
+        ("LShift", true) => ffi::PyNumber_InPlaceLshift,
+        ("RShift", false) => ffi::PyNumber_Rshift,
+        ("RShift", true) => ffi::PyNumber_InPlaceRshift,
         _ => {
             return Err(PyRuntimeError::new_err(format!(
                 "unknown binary operation {name}"
             )));
         }
     };
-    let name = if inplace {
-        format!("i{}", name.trim_end_matches('_'))
-    } else {
-        name.to_owned()
-    };
-    Ok(py
-        .import("operator")?
-        .getattr(name)?
-        .call1((left.bind(py), right.bind(py)))?
-        .unbind())
+    // These Stable ABI operations implement Python's reflected/in-place dispatch
+    // directly, without importing the independently mutable operator module.
+    unsafe { Bound::from_owned_ptr_or_err(py, operation(left, right)) }.map(Bound::unbind)
 }
 fn constant(py: Python<'_>, n: &Node) -> PyResult<Object> {
     match n {
@@ -918,6 +981,72 @@ fn constant(py: Python<'_>, n: &Node) -> PyResult<Object> {
         _ if op(n) == "Ellipsis" => Ok(py.Ellipsis()),
         _ => Err(PyRuntimeError::new_err("unknown constant")),
     }
+}
+fn compare(py: Python<'_>, f: &mut Frame, n: &Node, conditional: bool) -> PyResult<Object> {
+    let mut left = eval(py, f, &n["left"])?;
+    let mut result = true.into_pyobject(py)?.to_owned().into_any().unbind();
+    for (index, (operator, other)) in array(n, "ops")
+        .iter()
+        .zip(array(n, "comparators"))
+        .enumerate()
+    {
+        let right = eval(py, f, other)?;
+        result = match op(operator) {
+            "Is" | "IsNot" => {
+                let v = left.bind(py).is(right.bind(py)) ^ (op(operator) == "IsNot");
+                v.into_pyobject(py)?.to_owned().into_any().unbind()
+            }
+            "In" | "NotIn" => {
+                let v = right.bind(py).contains(left.bind(py))? ^ (op(operator) == "NotIn");
+                v.into_pyobject(py)?.to_owned().into_any().unbind()
+            }
+            name => {
+                let operation = match name {
+                    "Eq" => pyo3::class::basic::CompareOp::Eq,
+                    "NotEq" => pyo3::class::basic::CompareOp::Ne,
+                    "Lt" => pyo3::class::basic::CompareOp::Lt,
+                    "LtE" => pyo3::class::basic::CompareOp::Le,
+                    "Gt" => pyo3::class::basic::CompareOp::Gt,
+                    "GtE" => pyo3::class::basic::CompareOp::Ge,
+                    _ => return Err(PyRuntimeError::new_err("unknown comparison")),
+                };
+                left.bind(py)
+                    .rich_compare(right.bind(py), operation)?
+                    .unbind()
+            }
+        };
+        if (conditional || index + 1 < array(n, "ops").len()) && !result.bind(py).is_truthy()? {
+            if conditional {
+                return Ok(false.into_pyobject(py)?.to_owned().into_any().unbind());
+            }
+            break;
+        }
+        left = right;
+    }
+    if conditional {
+        Ok(true.into_pyobject(py)?.to_owned().into_any().unbind())
+    } else {
+        Ok(result)
+    }
+}
+fn truth(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<bool> {
+    if op(n) == "BoolOp" {
+        let conjunction = op(&n["op"]) == "And";
+        for value in array(n, "values") {
+            let value = truth(py, f, value)?;
+            if value != conjunction {
+                return Ok(value);
+            }
+        }
+        return Ok(conjunction);
+    }
+    if op(n) == "Compare" {
+        return compare(py, f, n, true)?.bind(py).is_truthy();
+    }
+    if op(n) == "UnaryOp" && op(&n["op"]) == "Not" {
+        return Ok(!truth(py, f, &n["operand"])?);
+    }
+    eval(py, f, n)?.bind(py).is_truthy()
 }
 fn eval(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Object> {
     if n.is_null() {
@@ -982,24 +1111,32 @@ fn eval(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Object> {
             binary(py, op(&n["op"]), &left, &right, false)
         }
         "UnaryOp" => {
+            if op(&n["op"]) == "Not" {
+                return Ok((!truth(py, f, &n["operand"])?)
+                    .into_pyobject(py)?
+                    .to_owned()
+                    .into_any()
+                    .unbind());
+            }
             let value = eval(py, f, &n["operand"])?;
-            let name = match op(&n["op"]) {
-                "Not" => "not_",
-                "USub" => "neg",
-                "UAdd" => "pos",
-                "Invert" => "invert",
-                _ => return Err(PyRuntimeError::new_err("unknown unary operation")),
+            let result = unsafe {
+                match op(&n["op"]) {
+                    "USub" => pyo3::ffi::PyNumber_Negative(value.as_ptr()),
+                    "UAdd" => pyo3::ffi::PyNumber_Positive(value.as_ptr()),
+                    "Invert" => pyo3::ffi::PyNumber_Invert(value.as_ptr()),
+                    _ => return Err(PyRuntimeError::new_err("unknown unary operation")),
+                }
             };
-            Ok(py
-                .import("operator")?
-                .getattr(name)?
-                .call1((value.bind(py),))?
-                .unbind())
+            unsafe { Bound::from_owned_ptr_or_err(py, result) }.map(Bound::unbind)
         }
         "BoolOp" => {
             let mut result = py.None();
-            for value in array(n, "values") {
+            let values = array(n, "values");
+            for (index, value) in values.iter().enumerate() {
                 result = eval(py, f, value)?;
+                if index + 1 == values.len() {
+                    break;
+                }
                 let truth = result.bind(py).is_truthy()?;
                 if (op(&n["op"]) == "And" && !truth) || (op(&n["op"]) == "Or" && truth) {
                     break;
@@ -1007,45 +1144,9 @@ fn eval(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Object> {
             }
             Ok(result)
         }
-        "Compare" => {
-            let mut left = eval(py, f, &n["left"])?;
-            let mut result = true.into_pyobject(py)?.to_owned().into_any().unbind();
-            for (operator, other) in array(n, "ops").iter().zip(array(n, "comparators")) {
-                let right = eval(py, f, other)?;
-                result = match op(operator) {
-                    "Is" | "IsNot" => {
-                        let v = left.bind(py).is(right.bind(py)) ^ (op(operator) == "IsNot");
-                        v.into_pyobject(py)?.to_owned().into_any().unbind()
-                    }
-                    "In" | "NotIn" => {
-                        let v = right.bind(py).contains(left.bind(py))? ^ (op(operator) == "NotIn");
-                        v.into_pyobject(py)?.to_owned().into_any().unbind()
-                    }
-                    name => {
-                        let name = match name {
-                            "Eq" => "eq",
-                            "NotEq" => "ne",
-                            "Lt" => "lt",
-                            "LtE" => "le",
-                            "Gt" => "gt",
-                            "GtE" => "ge",
-                            _ => return Err(PyRuntimeError::new_err("unknown comparison")),
-                        };
-                        py.import("operator")?
-                            .getattr(name)?
-                            .call1((left.bind(py), right.bind(py)))?
-                            .unbind()
-                    }
-                };
-                if !result.bind(py).is_truthy()? {
-                    break;
-                }
-                left = right;
-            }
-            Ok(result)
-        }
+        "Compare" => compare(py, f, n, false),
         "IfExp" => {
-            if eval(py, f, &n["test"])?.bind(py).is_truthy()? {
+            if truth(py, f, &n["test"])? {
                 eval(py, f, &n["body"])
             } else {
                 eval(py, f, &n["orelse"])
@@ -1194,17 +1295,10 @@ fn assign(py: Python<'_>, f: &mut Frame, target: &Node, value: &Object) -> PyRes
             owner.bind(py).set_item(key.bind(py), value.bind(py))
         }
         "Tuple" | "List" => {
-            let items = value.bind(py).try_iter()?.collect::<PyResult<Vec<_>>>()?;
             let targets = array(target, "elts");
-            if items.len() != targets.len() {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "expected {} values to unpack, got {}",
-                    targets.len(),
-                    items.len()
-                )));
-            }
+            let items = fast::unpack(py, value.bind(py), targets.len())?;
             for (target, value) in targets.iter().zip(items) {
-                assign(py, f, target, &value.unbind())?;
+                assign(py, f, target, &value)?;
             }
             Ok(())
         }
@@ -1244,6 +1338,56 @@ fn block(py: Python<'_>, f: &mut Frame, body: &[Node]) -> PyResult<Flow> {
     }
     Ok(Flow::Next)
 }
+// Resume the ordinary native exception handlers after a direct successful-path operation.
+fn finish_try(py: Python<'_>, f: &mut Frame, n: &Node, result: PyResult<Flow>) -> PyResult<Flow> {
+    let mut result = match result {
+        Ok(Flow::Next) => block(py, f, array(n, "orelse")),
+        Ok(flow) => Ok(flow),
+        Err(error) => {
+            let mut handler = None;
+            for candidate in array(n, "handlers") {
+                if candidate["type"].is_null()
+                    || error.matches(py, eval(py, f, &candidate["type"])?.bind(py))?
+                {
+                    handler = Some(candidate);
+                    break;
+                }
+            }
+            if let Some(handler) = handler {
+                let _handled = HandledException::enter(py, &error);
+                let previous = f.exception.take();
+                f.exception = Some(error.clone_ref(py));
+                if let Some(name) = handler["name"].as_str() {
+                    f.locals.bind(py).set_item(name, error.value(py))?;
+                }
+                let result = block(py, f, array(handler, "body"));
+                if let Some(name) = handler["name"].as_str()
+                    && f.locals.bind(py).contains(name)?
+                {
+                    f.locals.bind(py).del_item(name)?;
+                }
+                f.exception = previous;
+                result
+            } else {
+                Err(error)
+            }
+        }
+    };
+    let previous = f.exception.take();
+    if let Err(error) = &result {
+        f.exception = Some(error.clone_ref(py));
+    }
+    let _handled = f
+        .exception
+        .as_ref()
+        .map(|error| HandledException::enter(py, error));
+    match block(py, f, array(n, "finalbody")) {
+        Ok(Flow::Next) => {}
+        other => result = other,
+    }
+    f.exception = previous;
+    result
+}
 fn statement(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Flow> {
     match op(n) {
         "Pass" => {}
@@ -1271,7 +1415,7 @@ fn statement(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Flow> {
         "Break" => return Ok(Flow::Break),
         "Continue" => return Ok(Flow::Continue),
         "If" => {
-            let truth = eval(py, f, &n["test"])?.bind(py).is_truthy()?;
+            let truth = truth(py, f, &n["test"])?;
             return block(
                 py,
                 f,
@@ -1301,7 +1445,7 @@ fn statement(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Flow> {
         }
         "While" => {
             let mut broke = false;
-            while eval(py, f, &n["test"])?.bind(py).is_truthy()? {
+            while truth(py, f, &n["test"])? {
                 match block(py, f, array(n, "body"))? {
                     Flow::Break => {
                         broke = true;
@@ -1316,7 +1460,7 @@ fn statement(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Flow> {
             }
         }
         "Assert" => {
-            if !eval(py, f, &n["test"])?.bind(py).is_truthy()? {
+            if !truth(py, f, &n["test"])? {
                 return Err(PyErr::from_value(
                     py.get_type::<PyAssertionError>()
                         .call1((eval(py, f, &n["msg"])?.bind(py),))?,
@@ -1361,53 +1505,7 @@ fn statement(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Flow> {
         }
         "Try" => {
             let result = block(py, f, array(n, "body"));
-            let mut result = match result {
-                Ok(Flow::Next) => block(py, f, array(n, "orelse")),
-                Ok(flow) => Ok(flow),
-                Err(error) => {
-                    let mut handler = None;
-                    for candidate in array(n, "handlers") {
-                        if candidate["type"].is_null()
-                            || error.matches(py, eval(py, f, &candidate["type"])?.bind(py))?
-                        {
-                            handler = Some(candidate);
-                            break;
-                        }
-                    }
-                    if let Some(handler) = handler {
-                        let _handled = HandledException::enter(py, &error);
-                        let previous = f.exception.take();
-                        f.exception = Some(error.clone_ref(py));
-                        if let Some(name) = handler["name"].as_str() {
-                            f.locals.bind(py).set_item(name, error.value(py))?;
-                        }
-                        let result = block(py, f, array(handler, "body"));
-                        if let Some(name) = handler["name"].as_str()
-                            && f.locals.bind(py).contains(name)?
-                        {
-                            f.locals.bind(py).del_item(name)?;
-                        }
-                        f.exception = previous;
-                        result
-                    } else {
-                        Err(error)
-                    }
-                }
-            };
-            let previous = f.exception.take();
-            if let Err(error) = &result {
-                f.exception = Some(error.clone_ref(py));
-            }
-            let _handled = f
-                .exception
-                .as_ref()
-                .map(|error| HandledException::enter(py, error));
-            match block(py, f, array(n, "finalbody")) {
-                Ok(Flow::Next) => {}
-                other => result = other,
-            }
-            f.exception = previous;
-            return result;
+            return finish_try(py, f, n, result);
         }
         "With" => return with_items(py, f, array(n, "items"), array(n, "body")),
         "FunctionDef" => {
@@ -1567,7 +1665,7 @@ fn class(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Object> {
         locals: namespace.clone().unbind(),
         closure: lexical_scope(py, f, !f.in_class)?,
         class_cell: Some(cell.clone().unbind()),
-        local_names: HashSet::new(),
+        local_names: Arc::new(HashSet::new()),
         first: None,
         exception: None,
         in_class: true,
@@ -1769,7 +1867,7 @@ fn resume(py: Python<'_>, f: &mut Frame, tasks: &mut Vec<Task>) -> PyResult<Opti
                         return Ok(Some(eval(py, f, &n["value"]["value"])?));
                     }
                     "If" => {
-                        let body = if eval(py, f, &n["test"])?.bind(py).is_truthy()? {
+                        let body = if truth(py, f, &n["test"])? {
                             array(&n, "body")
                         } else {
                             array(&n, "orelse")
@@ -1825,7 +1923,7 @@ fn resume(py: Python<'_>, f: &mut Frame, tasks: &mut Vec<Task>) -> PyResult<Opti
                 }
             }
             Task::While(n) => {
-                if eval(py, f, &n["test"])?.bind(py).is_truthy()? {
+                if truth(py, f, &n["test"])? {
                     let body = array(&n, "body").to_vec();
                     tasks.push(Task::While(n));
                     tasks.push(Task::Block(body, 0));
@@ -1839,7 +1937,7 @@ fn resume(py: Python<'_>, f: &mut Frame, tasks: &mut Vec<Task>) -> PyResult<Opti
                     assign(py, f, &generator["target"], &value.unbind())?;
                     let mut accepted = true;
                     for test in array(generator, "ifs") {
-                        if !eval(py, f, test)?.bind(py).is_truthy()? {
+                        if !truth(py, f, test)? {
                             accepted = false;
                             break;
                         }
@@ -1924,7 +2022,7 @@ pub fn execute(py: Python<'_>, module: &Bound<'_, PyModule>, definition: &Node) 
         locals: namespace.unbind(),
         closure: None,
         class_cell: None,
-        local_names: HashSet::new(),
+        local_names: Arc::new(HashSet::new()),
         first: None,
         exception: None,
         in_class: false,
@@ -1937,15 +2035,19 @@ pub fn install(py: Python<'_>, program: &Node) -> PyResult<()> {
         .import("sys")?
         .getattr("modules")?
         .cast_into::<PyDict>()?;
-    for definition in array(program, "modules") {
+    let definitions: Vec<_> = array(program, "modules")
+        .iter()
+        .map(|definition| Arc::new(definition.clone()))
+        .collect();
+    for definition in &definitions {
         let name = s(definition, "name");
         let module = PyModule::new(py, name)?;
-        crate::loader::metadata(py, &module, definition)?;
+        crate::loader::metadata(py, &module, definition.clone())?;
         execute(py, &module, definition)?;
         modules.set_item(name, &module)?;
         let (parent, attr) = name.rsplit_once('.').unwrap();
         py.import(parent)?.setattr(attr, &module)?;
     }
-    crate::loader::install(py, program)?;
+    crate::loader::install(py, definitions)?;
     Ok(())
 }

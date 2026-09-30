@@ -31,7 +31,7 @@ impl EngineLoader {
 }
 #[pyclass(module = "rustializer._native")]
 struct EngineFinder {
-    program: Arc<Value>,
+    definitions: Vec<Arc<Value>>,
 }
 #[pymethods]
 impl EngineFinder {
@@ -44,13 +44,12 @@ impl EngineFinder {
         target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let _ = (path, target);
-        let definition = self.program["modules"]
-            .as_array()
-            .unwrap()
+        let definition = self
+            .definitions
             .iter()
             .find(|n| n["name"].as_str() == Some(fullname));
         match definition {
-            Some(definition) => spec(py, definition),
+            Some(definition) => spec(py, definition.clone()),
             None => Ok(py.None()),
         }
     }
@@ -71,36 +70,30 @@ fn filename(py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         .call1((root, tail))?
         .unbind())
 }
-fn spec(py: Python<'_>, definition: &Value) -> PyResult<Py<PyAny>> {
-    let name = definition["name"].as_str().unwrap();
-    let loader = Py::new(
-        py,
-        EngineLoader {
-            definition: Arc::new(definition.clone()),
-        },
-    )?;
+fn spec(py: Python<'_>, definition: Arc<Value>) -> PyResult<Py<PyAny>> {
+    let name = definition["name"].as_str().unwrap().to_owned();
+    let loader = Py::new(py, EngineLoader { definition })?;
     let spec = py
         .import("importlib.machinery")?
         .getattr("ModuleSpec")?
-        .call1((name, loader))?;
-    spec.setattr("origin", filename(py, name)?)?;
+        .call1((&name, loader))?;
+    spec.setattr("origin", filename(py, &name)?)?;
     spec.setattr("has_location", true)?;
     Ok(spec.unbind())
 }
-pub fn metadata(py: Python<'_>, module: &Bound<'_, PyModule>, definition: &Value) -> PyResult<()> {
+pub fn metadata(
+    py: Python<'_>,
+    module: &Bound<'_, PyModule>,
+    definition: Arc<Value>,
+) -> PyResult<()> {
     let spec = spec(py, definition)?;
     module.setattr("__file__", spec.bind(py).getattr("origin")?)?;
     module.setattr("__loader__", spec.bind(py).getattr("loader")?)?;
     module.setattr("__spec__", spec)?;
     Ok(())
 }
-pub fn install(py: Python<'_>, program: &Value) -> PyResult<()> {
-    let finder = Py::new(
-        py,
-        EngineFinder {
-            program: Arc::new(program.clone()),
-        },
-    )?;
+pub fn install(py: Python<'_>, definitions: Vec<Arc<Value>>) -> PyResult<()> {
+    let finder = Py::new(py, EngineFinder { definitions })?;
     py.import("sys")?
         .getattr("meta_path")?
         .call_method1("insert", (0, finder))?;

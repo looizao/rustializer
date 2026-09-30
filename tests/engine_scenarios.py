@@ -315,4 +315,75 @@ for operation in ('send-before-start', 'send', 'close', 'throw'):
         observed.extend([type(error).__name__, str(error)])
     results['generator-protocol'].append([operation, observed])
 
+from rest_framework.validators import UniqueValidator
+truth_events = []
+class TruthToken:
+    def __init__(self, value):
+        self.value = value
+    def __bool__(self):
+        truth_events.append(self.value)
+        return self.value
+class EqualityHook:
+    def __init__(self, token):
+        self.token = token
+    def __eq__(self, other):
+        return self.token
+results['truthiness-callbacks'] = []
+for attribute, value in (('lookup', True), ('message', True), ('message', False)):
+    token = TruthToken(value)
+    left, right = UniqueValidator([]), UniqueValidator([])
+    setattr(left, attribute, EqualityHook(token))
+    setattr(right, attribute, EqualityHook(token))
+    truth_events.clear()
+    result = left == right
+    results['truthiness-callbacks'].append([attribute, value, result is token, list(truth_events)])
+
+import operator
+with patch.object(operator, 'add', side_effect=AssertionError('unrelated operator patch')):
+    arithmetic_field = serializers.IntegerField()
+    results['native-arithmetic-dispatch'] = arithmetic_field.run_validation('5')
+
+mutation_events = []
+class RenameField(serializers.IntegerField):
+    def to_representation(self, value):
+        mutation_events.append(['represent', self.field_name, value])
+        self.field_name = 'renamed'
+        return super().to_representation(value)
+class RenameSerializer(serializers.Serializer):
+    number = RenameField()
+results['representation-key-mutation'] = [RenameSerializer({'number': 3}).data, mutation_events]
+
+child_events = []
+class NextChild(serializers.BaseSerializer):
+    def to_representation(self, value):
+        child_events.append(['next', value])
+        return value + 10
+class FirstChild(serializers.BaseSerializer):
+    def to_representation(self, value):
+        child_events.append(['first', value])
+        self.parent.child = NextChild()
+        return value
+changing_list = serializers.ListSerializer(child=FirstChild())
+results['list-child-mutation'] = [changing_list.to_representation([1, 2, 3]), child_events]
+
+class UnpackField(serializers.IntegerField):
+    def validate_empty_values(self, data):
+        return data
+results['validation-unpack'] = []
+for supplied in ((), (False,), (False, '4'), (False, '4', 'extra'), 7):
+    try:
+        result = UnpackField().run_validation(supplied)
+        results['validation-unpack'].append(['value', result])
+    except Exception as error:
+        results['validation-unpack'].append([type(error).__name__, str(error)])
+unpack_events = []
+def too_many_values():
+    for index in range(5):
+        unpack_events.append(index)
+        yield index
+try:
+    UnpackField().run_validation(too_many_values())
+except ValueError as error:
+    results['unpack-iterator-effects'] = [str(error), unpack_events]
+
 print(json.dumps(results, sort_keys=True, default=str))

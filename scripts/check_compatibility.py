@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tarfile
@@ -34,7 +35,7 @@ print(json.dumps({'python':platform.python_version(),'django':django.get_version
     'drf':rest_framework.VERSION,'reference':_native._reference_commit,
     'platform':platform.system(),'architecture':platform.machine(),
     'binary_sha256':hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest(),
-    'extension':_native.__file__}))
+    'extension':_native.__file__, 'drf_package':rest_framework.__file__}))
 '''
 
 
@@ -89,7 +90,12 @@ def main():
                 run(['git', '-C', checkout, 'archive', REFERENCES[version], '-o', archive], work / f'archive-{version}.log')
                 with tarfile.open(archive) as content:
                     content.extractall(source, filter='data')
-            references[version] = source
+            suite = work / f'installed-wheel-suite-{version}'
+            suite.mkdir(exist_ok=True)
+            shutil.copytree(source / 'tests', suite / 'tests', dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            shutil.copy2(source / 'pyproject.toml', suite / 'pyproject.toml')
+            references[version] = (source, suite)
             distribution = work / f'reference-wheel-{version}'
             distribution.mkdir(exist_ok=True)
             run([options.uv, 'build', source, '--wheel', '--out-dir', distribution],
@@ -126,7 +132,7 @@ def main():
                 request = f'cpython-{version}-{system}-{options.architecture}-{libc}'
             run([options.uv, 'venv', '--python', request, virtualenv], directory / 'venv.log', env=environment)
             python = virtualenv / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-            source = references[drf]
+            source, suite = references[drf]
             major, minor = map(int, django.split('.'))
             upper = f'{major}.{minor + 1}'
             optional = ['--group', f'{source / "pyproject.toml"}:optional']
@@ -145,6 +151,8 @@ def main():
                                    check=True, text=True, capture_output=True)
             metadata = json.loads(probe.stdout)
             metadata['psycopg_installation'] = options.psycopg
+            if not Path(metadata['drf_package']).is_relative_to(virtualenv):
+                raise RuntimeError(f'expected installed DRF wheel, got: {metadata}')
             if metadata['binary_sha256'] != digest or metadata['reference'] != REFERENCES[drf]:
                 raise RuntimeError(f'binary or source reference mismatch: {metadata}')
             if not metadata['python'].startswith(version + '.') or not metadata['django'].startswith(django + '.'):
@@ -158,12 +166,13 @@ def main():
                 directory / 'integration.log', cwd=directory, env=environment)
             if not options.no_baseline:
                 metadata['baseline_seconds'] = run([python, '-m', 'pytest', '-q', '--tb=short'],
-                    directory / 'baseline.log', cwd=source, env=environment)
+                    directory / 'baseline.log', cwd=suite, env=environment)
             activated = dict(environment, PYTHONPATH=str(plugin))
             metadata['activated_seconds'] = run([python, '-m', 'pytest', '-p', 'rustializer_activation', '-q', '--tb=short'],
-                directory / 'activated.log', cwd=source, env=activated)
+                directory / 'activated.log', cwd=suite, env=activated)
             metadata['result'] = (directory / 'activated.log').read_text().splitlines()[-1]
             metadata['logs'] = str(directory)
+            (directory / 'runtime.json').write_text(json.dumps(metadata, indent=2) + '\n')
             return metadata
 
         failures = []

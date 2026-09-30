@@ -53,6 +53,10 @@ def worker(options):
                 'django': django.get_version(), 'drf': rest_framework.VERSION,
                 'platform': platform.system(), 'architecture': platform.machine(),
                 'startup_ns': startup, 'startup_peak_rss_bytes': peak_rss()}
+    if options.engine == 'native':
+        from rustializer import _native
+        metadata.update(binary_sha256=hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest(),
+                        reference_commit=_native._reference_commit)
     if options.startup_only:
         return metadata
 
@@ -174,6 +178,10 @@ def main():
     for engine, runs in results.items():
         first = runs[0]
         summary[engine] = {key: first[key] for key in ('python', 'django', 'drf', 'platform', 'architecture')}
+        if engine == 'native':
+            summary[engine].update({key: first[key] for key in ('binary_sha256', 'reference_commit')})
+            if any(run['binary_sha256'] != first['binary_sha256'] for run in runs):
+                raise RuntimeError('native binary changed during measurement')
         summary[engine].update(startup_process_p50_ms=statistics.median(startups[engine]) / 1e6,
             startup_import_p50_ms=statistics.median(r['startup_ns'] for r in runs) / 1e6,
             startup_peak_rss_p50_bytes=statistics.median(r['startup_peak_rss_bytes'] for r in runs),

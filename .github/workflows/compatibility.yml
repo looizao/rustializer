@@ -75,6 +75,16 @@ jobs:
           uv run --python .build-env --no-project python scripts/check_compatibility.py dist/*.whl "${dependency_flags[@]}" \
             --python ${{ matrix.python }} --architecture ${{ matrix.architecture }} \
             --jobs 2 --work-directory compatibility-results
+      - name: Measure representation, validation, model fields, startup, and memory after compatibility passes
+        run: |
+          for version in 3.17.2 3.18.1; do
+            runtime="compatibility-results/drf-$version-py3.12-django5.2/env/bin/python"
+            if [[ "$RUNNER_OS" == Windows ]]; then
+              runtime="compatibility-results/drf-$version-py3.12-django5.2/env/Scripts/python.exe"
+            fi
+            uv run --python .build-env --no-project python scripts/benchmark_engine.py --python "$runtime" \
+              > "compatibility-results/performance-drf-$version.json"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -82,4 +92,6 @@ jobs:
           path: |
             dist/*.whl
             compatibility-results/**/*.log
+            compatibility-results/**/runtime.json
+            compatibility-results/performance-*.json
           retention-days: 14
