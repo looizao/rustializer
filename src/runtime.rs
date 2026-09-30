@@ -506,33 +506,90 @@ impl EngineFunction {
         self.defaults.as_ref().map(|v| v.clone_ref(py))
     }
     #[setter(__defaults__)]
-    fn set_defaults(&mut self, value: Option<Py<PyTuple>>) {
-        self.defaults = value;
+    fn set_defaults(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.defaults = if value.is_none() {
+            None
+        } else {
+            Some(
+                value
+                    .cast::<PyTuple>()
+                    .map_err(|_| {
+                        PyTypeError::new_err("__defaults__ must be set to a tuple object")
+                    })?
+                    .clone()
+                    .unbind(),
+            )
+        };
+        Ok(())
     }
     #[getter]
     fn __kwdefaults__(&self, py: Python<'_>) -> Option<Py<PyDict>> {
         self.kw_defaults.as_ref().map(|v| v.clone_ref(py))
     }
     #[setter(__kwdefaults__)]
-    fn set_kwdefaults(&mut self, value: Option<Py<PyDict>>) {
-        self.kw_defaults = value;
+    fn set_kwdefaults(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.kw_defaults = if value.is_none() {
+            None
+        } else {
+            Some(
+                value
+                    .cast::<PyDict>()
+                    .map_err(|_| {
+                        PyTypeError::new_err("__kwdefaults__ must be set to a dict object")
+                    })?
+                    .clone()
+                    .unbind(),
+            )
+        };
+        Ok(())
     }
     #[getter]
     fn __annotations__(&self, py: Python<'_>) -> Py<PyDict> {
         self.annotations.as_ref().unwrap().clone_ref(py)
     }
     #[setter(__annotations__)]
-    fn set_annotations(&mut self, value: Py<PyDict>) {
-        self.annotations = Some(value);
+    fn set_annotations(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.annotations = Some(if value.is_none() {
+            PyDict::new(value.py()).unbind()
+        } else {
+            value
+                .cast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("__annotations__ must be set to a dict object"))?
+                .clone()
+                .unbind()
+        });
+        Ok(())
     }
     fn __reduce__(&self, py: Python<'_>) -> PyResult<Object> {
         Ok(self.qualname.clone().into_pyobject(py)?.into_any().unbind())
     }
     #[getter]
+    fn __text_signature__(&self) -> Option<String> {
+        let spec = &self.node["args"];
+        // The pinned JSON wrappers deliberately accept only variadic arguments.
+        // inspect uses this when follow_wrapped=False; normal inspection unwraps.
+        if array(spec, "args").is_empty()
+            && array(spec, "posonlyargs").is_empty()
+            && array(spec, "kwonlyargs").is_empty()
+            && !spec["vararg"].is_null()
+            && !spec["kwarg"].is_null()
+        {
+            Some(format!(
+                "(*{}, **{})",
+                s(&spec["vararg"], "arg"),
+                s(&spec["kwarg"], "arg")
+            ))
+        } else {
+            None
+        }
+    }
+    #[getter]
     fn __signature__(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Object> {
         let inspect = py.import("inspect")?;
-        if let Ok(wrapped) = slf.getattr("__wrapped__") {
-            return Ok(inspect.getattr("signature")?.call1((wrapped,))?.unbind());
+        if slf.hasattr("__wrapped__")? {
+            return Err(pyo3::exceptions::PyAttributeError::new_err(
+                "wrapped native function uses its wrapped signature",
+            ));
         }
         let this = slf.borrow();
         let self_ = &*this;
@@ -1438,6 +1495,7 @@ fn with_items(py: Python<'_>, f: &mut Frame, items: &[Node], body: &[Node]) -> P
             Ok(flow)
         }
         Err(error) => {
+            let _handled = HandledException::enter(py, &error);
             let suppressed = exit
                 .call1((
                     manager.bind(py),

@@ -236,7 +236,8 @@ for method, args, kwargs in (
 # Public callable behavior, including saved methods and mutable defaults.
 from rest_framework.utils import timezone as drf_timezone, json as drf_json
 results['annotated-signature'] = str(inspect.signature(drf_timezone.datetime_ambiguous))
-results['wrapped-signature'] = str(inspect.signature(drf_json.dumps))
+results['wrapped-signature'] = [str(inspect.signature(drf_json.dumps)),
+    str(inspect.signature(drf_json.dumps, follow_wrapped=False))]
 method_field = serializers.IntegerField()
 saved_method = method_field.run_validation
 results['bound-methods'] = [saved_method == method_field.run_validation,
@@ -273,6 +274,26 @@ with patch.object(warnings, 'warn') as warning_hook:
     serializers.DecimalField(max_digits=4, decimal_places=2, min_value=1.0)
     results['warning-hook'] = [[str(call.args[0]), sorted(call.kwargs)]
         for call in warning_hook.call_args_list]
+
+results['callable-mutation-errors'] = []
+for name in ('__defaults__', '__kwdefaults__', '__annotations__'):
+    try:
+        setattr(serializers.Field.run_validation, name, [])
+    except Exception as error:
+        results['callable-mutation-errors'].append([name, type(error).__name__, str(error)])
+
+import contextlib
+original_exit = contextlib.suppress.__exit__
+context_events = []
+def exit_hook(self, typ, value, traceback):
+    context_events.append([typ.__name__, sys.exc_info()[1] is value])
+    return original_exit(self, typ, value, traceback)
+with patch.object(contextlib.suppress, '__exit__', exit_hook):
+    try:
+        serializers.BooleanField().run_validation([])
+    except ValidationError:
+        pass
+results['context-manager-exception'] = context_events
 
 results['generator-protocol'] = []
 for operation in ('send-before-start', 'send', 'close', 'throw'):
