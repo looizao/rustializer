@@ -34,32 +34,9 @@ def peak_rss():
     return value if sys.platform == 'darwin' else value * 1024
 
 
-def worker(options):
-    import gc
-    start = time.perf_counter_ns()
-    if options.engine == 'native':
-        import rustializer
-        rustializer.activate()
-    from django.conf import settings
-    settings.configure(USE_I18N=False, USE_TZ=True, INSTALLED_APPS=[],
-                       DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}})
-    import django
-    django.setup()
+def sample_cases(records):
     from django.db import models
     from rest_framework import serializers
-    import rest_framework
-    startup = time.perf_counter_ns() - start
-    metadata = {'engine': options.engine, 'python': platform.python_version(),
-                'django': django.get_version(), 'drf': rest_framework.VERSION,
-                'platform': platform.system(), 'architecture': platform.machine(),
-                'startup_ns': startup, 'startup_peak_rss_bytes': peak_rss()}
-    if options.engine == 'native':
-        from rustializer import _native
-        metadata.update(binary_sha256=hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest(),
-                        reference_commit=_native._reference_commit)
-    if options.startup_only:
-        return metadata
-
     class Item(serializers.Serializer):
         id = serializers.IntegerField(min_value=0)
         name = serializers.CharField(max_length=40)
@@ -84,7 +61,7 @@ def worker(options):
             fields = '__all__'
 
     row = {'id': 7, 'name': 'sample', 'active': True, 'score': '12.50', 'tags': ['a', 'b']}
-    rows = [dict(row, id=i) for i in range(options.records)]
+    rows = [dict(row, id=i) for i in range(records)]
     warm = Item()
     nested = Collection()
     nested_data = {'title': 'batch', 'items': rows}
@@ -98,11 +75,50 @@ def worker(options):
     cases = {
         'warm_representation': (lambda: warm.to_representation(row), 1),
         'fresh_representation': (lambda: Item(row).data, 1),
-        'nested_many_representation': (lambda: nested.to_representation(nested_data), options.records),
+        'nested_many_representation': (lambda: nested.to_representation(nested_data), records),
         'valid_input': (lambda: validation(row), 1),
         'invalid_input': (lambda: validation(invalid), 1),
         'model_field_generation': (lambda: list(ModelSerializer().fields), 1),
     }
+    return cases, Item, row
+
+
+def worker(options):
+    import gc
+    start = time.perf_counter_ns()
+    if options.engine == 'native':
+        import rustializer
+        rustializer.activate()
+    if options.mayo_copy:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from benchmark_mayo import setup_mayo
+        django, rest_framework = setup_mayo(options.mayo_copy)
+    else:
+        from django.conf import settings
+        settings.configure(USE_I18N=False, USE_TZ=True, INSTALLED_APPS=[],
+                           DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}})
+        import django
+        django.setup()
+        import rest_framework
+        from rest_framework import serializers
+    startup = time.perf_counter_ns() - start
+    metadata = {'engine': options.engine, 'python': platform.python_version(),
+                'django': django.get_version(), 'drf': rest_framework.VERSION,
+                'platform': platform.system(), 'architecture': platform.machine(),
+                'startup_ns': startup, 'startup_peak_rss_bytes': peak_rss()}
+    if options.engine == 'native':
+        from rustializer import _native
+        metadata.update(binary_sha256=hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest(),
+                        reference_commit=_native._reference_commit)
+    if options.startup_only:
+        return metadata
+
+    if options.mayo_copy:
+        from benchmark_mayo import mayo_cases
+        cases, Item, row = mayo_cases(options.records)
+    else:
+        cases, Item, row = sample_cases(options.records)
+
     observations = {}
     for name, (operation, units) in cases.items():
         for _ in range(5):
@@ -148,6 +164,7 @@ def main():
     parser.add_argument('--records', type=int, default=50)
     parser.add_argument('--memory-objects', type=int, default=1000)
     parser.add_argument('--engines', nargs='+', choices=('reference', 'native'), default=['reference', 'native'])
+    parser.add_argument('--mayo-copy', type=Path, help='benchmark serializer-only workloads from an isolated Mayo copy')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--engine', choices=('reference', 'native'), help=argparse.SUPPRESS)
     parser.add_argument('--startup-only', action='store_true', help=argparse.SUPPRESS)
@@ -168,11 +185,17 @@ def main():
             command = [options.python, '-I', str(Path(__file__).resolve()), '--worker', '--engine', engine,
                        '--iterations', str(options.iterations), '--records', str(options.records),
                        '--memory-objects', str(options.memory_objects)]
+            if options.mayo_copy:
+                command.extend(['--mayo-copy', str(options.mayo_copy.resolve())])
             before = time.perf_counter_ns()
             startup = subprocess.run([*command, '--startup-only'], env=environment,
-                                     capture_output=True, text=True, check=True)
+                                     capture_output=True, text=True)
+            if startup.returncode:
+                raise RuntimeError(startup.stderr[-6000:])
             startups[engine].append(time.perf_counter_ns() - before)
-            result = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
+            result = subprocess.run(command, env=environment, capture_output=True, text=True)
+            if result.returncode:
+                raise RuntimeError(result.stderr[-6000:])
             results[engine].append(json.loads(result.stdout))
     summary = {}
     for engine, runs in results.items():
@@ -204,7 +227,7 @@ def main():
         for name in summary['reference']['cases']:
             if summary['reference']['cases'][name]['output_sha256'] != summary['native']['cases'][name]['output_sha256']:
                 raise RuntimeError(f'reference/native output mismatch for {name}')
-    print(json.dumps({'samples': options.samples, 'iterations_per_sample': options.iterations,
+    print(json.dumps({'workload': 'mayo' if options.mayo_copy else 'sample', 'samples': options.samples, 'iterations_per_sample': options.iterations,
                       'records_per_many_call': options.records, 'results': summary}, indent=2))
 
 

@@ -370,7 +370,9 @@ class UnpackField(serializers.IntegerField):
     def validate_empty_values(self, data):
         return data
 results['validation-unpack'] = []
-for supplied in ((), (False,), (False, '4'), (False, '4', 'extra'), 7):
+for supplied in ((), (False,), (False, '4'), (False, '4', 'extra'),
+                 [False, '4', 'extra'], {False: 1, '4': 2, 'extra': 3},
+                 iter((False, '4', 'extra')), 7):
     try:
         result = UnpackField().run_validation(supplied)
         results['validation-unpack'].append(['value', result])

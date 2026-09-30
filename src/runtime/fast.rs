@@ -323,6 +323,21 @@ pub(super) fn unpack(
     }
     if let Some(item) = iterator.next() {
         item?;
+        // CPython 3.14 adds the actual size for exact built-in containers.
+        // Iterator and subclass errors still use the older wording.
+        let version = unsafe { std::ffi::CStr::from_ptr(pyo3::ffi::Py_GetVersion()) }.to_bytes();
+        let modern = version.starts_with(b"3.14.") || version.starts_with(b"3.15.");
+        let exact_container = value.get_type().is(py.get_type::<PyTuple>())
+            || value.get_type().is(py.get_type::<PyList>())
+            || value.get_type().is(py.get_type::<PyDict>());
+        if modern && exact_container {
+            let length = value.len()?;
+            if length > count {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "too many values to unpack (expected {count}, got {length})"
+                )));
+            }
+        }
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "too many values to unpack (expected {count})"
         )));
