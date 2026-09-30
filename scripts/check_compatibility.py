@@ -148,7 +148,9 @@ def main():
                  '--group', f'{source / "pyproject.toml"}:test', *optional,
                  f'Django>={django},<{upper}', 'pillow', reference_wheels[drf], wheel], directory / 'install.log', env=environment)
             probe = subprocess.run([str(python), '-I', '-X', 'dev', '-c', PROBE], env=environment,
-                                   check=True, text=True, capture_output=True)
+                                   text=True, capture_output=True)
+            if probe.returncode:
+                raise RuntimeError(f'installed-package probe exited {probe.returncode}: {probe.stderr[-6000:]}')
             metadata = json.loads(probe.stdout)
             metadata['psycopg_installation'] = options.psycopg
             if not Path(metadata['drf_package']).is_relative_to(virtualenv):

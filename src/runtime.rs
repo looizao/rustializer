@@ -195,8 +195,10 @@ struct EngineFunction {
     underlying: Option<Object>,
     name: String,
     qualname: String,
-    module: String,
-    doc: Option<String>,
+    name_object: Option<Py<PyString>>,
+    qualname_object: Option<Py<PyString>>,
+    module: Option<Object>,
+    doc: Option<Object>,
 }
 fn missing_arguments(name: &str, kind: &str, names: &[&str]) -> PyErr {
     let quoted: Vec<_> = names.iter().map(|name| format!("'{name}'")).collect();
@@ -223,13 +225,16 @@ impl EngineFunction {
             class_cell: self.class_cell.as_ref().map(|v| v.clone_ref(py)),
             defaults: self.defaults.as_ref().map(|v| v.clone_ref(py)),
             kw_defaults: self.kw_defaults.as_ref().map(|v| v.clone_ref(py)),
-            annotations: self.annotations.as_ref().map(|v| v.clone_ref(py)),
+            annotations: None,
             receiver,
             underlying: self.underlying.as_ref().map(|v| v.clone_ref(py)),
             name: self.name.clone(),
             qualname: self.qualname.clone(),
-            module: self.module.clone(),
-            doc: self.doc.clone(),
+            // Invocation snapshots must not retain unrelated mutable metadata.
+            name_object: None,
+            qualname_object: None,
+            module: None,
+            doc: None,
         }
     }
     fn bind(
@@ -454,10 +459,15 @@ impl EngineFunction {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Object> {
         let py = slf.py();
-        let function = slf
+        let mut function = slf
             .borrow()
             .copied(py, slf.borrow().receiver.as_ref().map(|v| v.clone_ref(py)));
         let mut frame = function.bind(py, args, kwargs)?;
+        // Values needed by this invocation are now owned by its locals.
+        // Releasing default containers here preserves finalizer timing when
+        // callbacks subsequently replace the function's defaults.
+        function.defaults = None;
+        function.kw_defaults = None;
         if function.is_generator {
             return Ok(Py::new(
                 py,
@@ -487,28 +497,63 @@ impl EngineFunction {
         }
     }
     #[getter]
-    fn __name__(&self) -> &str {
-        &self.name
+    fn __name__(&self, py: Python<'_>) -> Py<PyString> {
+        self.name_object.as_ref().unwrap().clone_ref(py)
     }
     #[setter(__name__)]
-    fn set_name(&mut self, value: String) {
-        self.name = value;
+    fn set_name(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = value
+            .cast::<PyString>()
+            .map_err(|_| PyTypeError::new_err("__name__ must be set to a string object"))?;
+        let old = {
+            let mut function = slf.borrow_mut();
+            function.name = value.extract()?;
+            function.name_object.replace(value.clone().unbind())
+        };
+        drop(old);
+        Ok(())
     }
     #[getter]
-    fn __qualname__(&self) -> &str {
-        &self.qualname
+    fn __qualname__(&self, py: Python<'_>) -> Py<PyString> {
+        self.qualname_object.as_ref().unwrap().clone_ref(py)
     }
     #[setter(__qualname__)]
-    fn set_qualname(&mut self, value: String) {
-        self.qualname = value;
+    fn set_qualname(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = value
+            .cast::<PyString>()
+            .map_err(|_| PyTypeError::new_err("__qualname__ must be set to a string object"))?;
+        let old = {
+            let mut function = slf.borrow_mut();
+            function.qualname = value.extract()?;
+            function.qualname_object.replace(value.clone().unbind())
+        };
+        drop(old);
+        Ok(())
     }
     #[getter]
-    fn __module__(&self) -> &str {
-        &self.module
+    fn __module__(&self, py: Python<'_>) -> Object {
+        self.module
+            .as_ref()
+            .map_or_else(|| py.None(), |v| v.clone_ref(py))
     }
     #[setter(__module__)]
-    fn set_module(&mut self, value: String) {
-        self.module = value;
+    fn set_module(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) {
+        let old = { slf.borrow_mut().module.replace(value.clone().unbind()) };
+        // A replaced metadata object may run a finalizer that re-enters us.
+        drop(old);
+    }
+    #[getter]
+    fn __globals__(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.globals
+            .as_ref()
+            .map(|v| v.clone_ref(py))
+            .ok_or_else(|| PyRuntimeError::new_err("cleared function"))
+    }
+    #[setter(__globals__)]
+    fn set_globals(&self, _value: &Bound<'_, PyAny>) -> PyResult<()> {
+        Err(pyo3::exceptions::PyAttributeError::new_err(
+            "readonly attribute",
+        ))
     }
     #[getter]
     fn __self__(&self, py: Python<'_>) -> PyResult<Object> {
@@ -531,20 +576,24 @@ impl EngineFunction {
             })
     }
     #[getter]
-    fn __doc__(&self) -> Option<&str> {
-        self.doc.as_deref()
+    fn __doc__(&self, py: Python<'_>) -> Object {
+        self.doc
+            .as_ref()
+            .map_or_else(|| py.None(), |v| v.clone_ref(py))
     }
     #[setter(__doc__)]
-    fn set_doc(&mut self, value: Option<String>) {
-        self.doc = value;
+    fn set_doc(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) {
+        let old = { slf.borrow_mut().doc.replace(value.clone().unbind()) };
+        // A replaced metadata object may run a finalizer that re-enters us.
+        drop(old);
     }
     #[getter]
     fn __defaults__(&self, py: Python<'_>) -> Option<Py<PyTuple>> {
         self.defaults.as_ref().map(|v| v.clone_ref(py))
     }
     #[setter(__defaults__)]
-    fn set_defaults(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.defaults = if value.is_none() {
+    fn set_defaults(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = if value.is_none() {
             None
         } else {
             Some(
@@ -557,6 +606,8 @@ impl EngineFunction {
                     .unbind(),
             )
         };
+        let old = { std::mem::replace(&mut slf.borrow_mut().defaults, value) };
+        drop(old);
         Ok(())
     }
     #[getter]
@@ -564,8 +615,8 @@ impl EngineFunction {
         self.kw_defaults.as_ref().map(|v| v.clone_ref(py))
     }
     #[setter(__kwdefaults__)]
-    fn set_kwdefaults(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.kw_defaults = if value.is_none() {
+    fn set_kwdefaults(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = if value.is_none() {
             None
         } else {
             Some(
@@ -578,6 +629,8 @@ impl EngineFunction {
                     .unbind(),
             )
         };
+        let old = { std::mem::replace(&mut slf.borrow_mut().kw_defaults, value) };
+        drop(old);
         Ok(())
     }
     #[getter]
@@ -585,8 +638,8 @@ impl EngineFunction {
         self.annotations.as_ref().unwrap().clone_ref(py)
     }
     #[setter(__annotations__)]
-    fn set_annotations(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.annotations = Some(if value.is_none() {
+    fn set_annotations(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = Some(if value.is_none() {
             PyDict::new(value.py()).unbind()
         } else {
             value
@@ -595,7 +648,58 @@ impl EngineFunction {
                 .clone()
                 .unbind()
         });
+        let old = { std::mem::replace(&mut slf.borrow_mut().annotations, value) };
+        drop(old);
         Ok(())
+    }
+    fn __setattr__(slf: &Bound<'_, Self>, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let name = PyString::new(slf.py(), name);
+        let result = unsafe {
+            pyo3::ffi::PyObject_GenericSetAttr(slf.as_ptr(), name.as_ptr(), value.as_ptr())
+        };
+        if result == -1 {
+            Err(PyErr::fetch(slf.py()))
+        } else {
+            Ok(())
+        }
+    }
+    fn __delattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<()> {
+        let py = slf.py();
+        match name {
+            "__name__" | "__qualname__" => Err(PyTypeError::new_err(format!(
+                "{name} must be set to a string object"
+            ))),
+            "__globals__" => Err(pyo3::exceptions::PyAttributeError::new_err(
+                "readonly attribute",
+            )),
+            "__dict__" => Err(PyTypeError::new_err("cannot delete __dict__")),
+            "__defaults__" => Self::set_defaults(slf, &py.None().into_bound(py)),
+            "__kwdefaults__" => Self::set_kwdefaults(slf, &py.None().into_bound(py)),
+            "__annotations__" => Self::set_annotations(slf, &py.None().into_bound(py)),
+            "__doc__" => {
+                Self::set_doc(slf, &py.None().into_bound(py));
+                Ok(())
+            }
+            "__module__" => {
+                Self::set_module(slf, &py.None().into_bound(py));
+                Ok(())
+            }
+            _ => {
+                let name = PyString::new(py, name);
+                let result = unsafe {
+                    pyo3::ffi::PyObject_GenericSetAttr(
+                        slf.as_ptr(),
+                        name.as_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if result == -1 {
+                    Err(PyErr::fetch(py))
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
     fn __reduce__(&self, py: Python<'_>) -> PyResult<Object> {
         Ok(self.qualname.clone().into_pyobject(py)?.into_any().unbind())
@@ -719,6 +823,10 @@ impl EngineFunction {
         visit.call(&self.defaults)?;
         visit.call(&self.kw_defaults)?;
         visit.call(&self.annotations)?;
+        visit.call(&self.name_object)?;
+        visit.call(&self.qualname_object)?;
+        visit.call(&self.module)?;
+        visit.call(&self.doc)?;
         Ok(())
     }
     fn __clear__(&mut self) {
@@ -730,6 +838,10 @@ impl EngineFunction {
         self.defaults = None;
         self.kw_defaults = None;
         self.annotations = None;
+        self.name_object = None;
+        self.qualname_object = None;
+        self.module = None;
+        self.doc = None;
     }
 }
 fn contains_yield(node: &Node, root: bool) -> bool {
@@ -890,10 +1002,16 @@ fn function(py: Python<'_>, frame: &mut Frame, node: &Node, in_class: bool) -> P
             doc: array(node, "body")
                 .first()
                 .filter(|v| op(v) == "Expr" && op(&v["value"]) == "Constant")
-                .and_then(|v| v["value"]["value"].as_str().map(str::to_owned)),
+                .and_then(|v| {
+                    v["value"]["value"]
+                        .as_str()
+                        .map(|v| PyString::new(py, v).into_any().unbind())
+                }),
+            name_object: Some(PyString::new(py, &name).unbind()),
+            qualname_object: Some(PyString::new(py, &qualname).unbind()),
             qualname,
             name,
-            module,
+            module: Some(PyString::new(py, &module).into_any().unbind()),
         },
     )?
     .into_any())

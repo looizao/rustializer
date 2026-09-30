@@ -394,4 +394,109 @@ with patch.object(inspect, 'isfunction', return_value=False) as function_hook, \
     result = is_simple_callable(serializers.Field.bind)
     results['inspection-callback-hooks'] = [result, function_hook.call_count, method_hook.call_count]
 
+metadata_function = serializers.Field.bind
+results['function-metadata-mutation'] = []
+class MetadataName(str):
+    pass
+for attribute in ('__name__', '__qualname__', '__module__', '__doc__'):
+    original = getattr(metadata_function, attribute)
+    value = MetadataName('changed') if attribute in ('__name__', '__qualname__') else [1, 2]
+    try:
+        setattr(metadata_function, attribute, value)
+        results['function-metadata-mutation'].append([attribute, getattr(metadata_function, attribute) is value])
+        setattr(metadata_function, attribute, None)
+        results['function-metadata-mutation'].append([attribute, getattr(metadata_function, attribute)])
+    except Exception as error:
+        results['function-metadata-mutation'].append([attribute, type(error).__name__, str(error)])
+    finally:
+        setattr(metadata_function, attribute, original)
+globals_function = serializers.CharField.to_representation
+original_str = globals_function.__globals__.get('str')
+had_str = 'str' in globals_function.__globals__
+try:
+    globals_function.__globals__['str'] = lambda value: 'overridden'
+    results['function-global-mutation'] = serializers.CharField().to_representation(5)
+finally:
+    if had_str:
+        globals_function.__globals__['str'] = original_str
+    else:
+        del globals_function.__globals__['str']
+
+record = RelationInfo(1, 2, True, None, False, False)
+results['record-metadata'] = {name: [str(inspect.signature(getattr(RelationInfo, name))),
+    getattr(RelationInfo, name).__module__, getattr(RelationInfo, name).__doc__]
+    for name in ('__new__', '_make', '_replace', '__repr__', '_asdict', '__getnewargs__')}
+results['record-replace-api'] = hasattr(record, '__replace__')
+if hasattr(copy, 'replace'):
+    results['record-copy-replace'] = observe(copy.replace(record, to_many=False))
+results['record-new-keyword'] = observe(RelationInfo.__new__(_cls=RelationInfo,
+    **dict(zip(RelationInfo._fields, record))))
+try:
+    record._replace(self=record)
+except Exception as error:
+    results['record-positional-self'] = [type(error).__name__, str(error)]
+original_fields = RelationInfo._fields
+try:
+    RelationInfo._fields = tuple('changed' for _ in original_fields)
+    results['record-field-name-mutation'] = [repr(record), observe(record._replace(model_field=7)), record._asdict()]
+finally:
+    RelationInfo._fields = original_fields
+record_events = []
+class HookRecord(RelationInfo):
+    @classmethod
+    def _make(cls, iterable):
+        record_events.append(type(iterable).__name__)
+        return super()._make(iterable)
+results['record-iterator-hook'] = [observe(HookRecord(*record)._replace(model_field=7)), record_events]
+
+results['function-metadata-deletion'] = []
+for attribute in ('__name__', '__qualname__', '__module__', '__doc__', '__defaults__',
+                  '__kwdefaults__', '__annotations__', '__globals__', '__dict__'):
+    original = getattr(metadata_function, attribute)
+    try:
+        delattr(metadata_function, attribute)
+        results['function-metadata-deletion'].append([attribute, getattr(metadata_function, attribute)])
+    except Exception as error:
+        results['function-metadata-deletion'].append([attribute, type(error).__name__, str(error)])
+    finally:
+        if attribute not in ('__globals__', '__dict__'):
+            setattr(metadata_function, attribute, original)
+
+metadata_events = []
+class MetadataFinalizer:
+    def __del__(self):
+        metadata_function.__doc__ = 'set by finalizer'
+        metadata_events.append('finalized')
+original_doc = metadata_function.__doc__
+try:
+    metadata_function.__doc__ = MetadataFinalizer()
+    metadata_function.__doc__ = 'replacement'
+    results['metadata-finalizer-reentry'] = [metadata_function.__doc__, metadata_events]
+finally:
+    metadata_function.__doc__ = original_doc
+
+metadata_events.clear()
+invoked_function = serializers.CharField.to_representation
+original_doc = invoked_function.__doc__
+had_str = 'str' in invoked_function.__globals__
+original_str = invoked_function.__globals__.get('str')
+class InvokedMetadataFinalizer:
+    def __del__(self):
+        metadata_events.append('finalized')
+def replacement_str(value):
+    invoked_function.__doc__ = 'replacement'
+    metadata_events.append('callback')
+    return str(value)
+try:
+    invoked_function.__doc__ = InvokedMetadataFinalizer()
+    invoked_function.__globals__['str'] = replacement_str
+    result = serializers.CharField().to_representation(7)
+    results['metadata-finalizer-during-call'] = [result, list(metadata_events)]
+finally:
+    invoked_function.__doc__ = original_doc
+    if had_str:
+        invoked_function.__globals__['str'] = original_str
+    else:
+        del invoked_function.__globals__['str']
+
 print(json.dumps(results, sort_keys=True, default=str))

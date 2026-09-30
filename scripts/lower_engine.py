@@ -54,26 +54,40 @@ def native_records(tree):
     _fields = {tuple(fields)!r}
     __match_args__ = _fields
     _field_defaults = {{}}
-    def __new__(cls, {arguments}):
-        return tuple.__new__(cls, ({arguments},))
+    def __new__(_cls, {arguments}):
+        """Create new instance of {name}({arguments})"""
+        return tuple.__new__(_cls, ({arguments},))
     @classmethod
     def _make(cls, iterable):
+        """Make a new {name} object from a sequence or iterable"""
         result = tuple.__new__(cls, iterable)
         if len(result) != {len(fields)}:
             raise TypeError('Expected {len(fields)} arguments, got %d' % len(result))
         return result
-    def _replace(self, **kwds):
-        result = self._make(kwds.pop(name, value) for name, value in zip(self._fields, self))
+    def _replace(self, /, **kwds):
+        """Return a new {name} object replacing specified fields with new values"""
+        result = self._make(map(kwds.pop, {tuple(fields)!r}, self))
         if kwds:
             error = TypeError if sys.version_info >= (3, 13) else ValueError
             raise error('Got unexpected field names: %r' % list(kwds))
         return result
+    if sys.version_info >= (3, 13):
+        __replace__ = _replace
     def _asdict(self):
+        """Return a new dict which maps field names to their values."""
         return dict(zip(self._fields, self))
     def __getnewargs__(self):
+        """Return self as a plain tuple.  Used by copy and pickle."""
         return tuple(self)
     def __repr__(self):
-        return self.__class__.__name__ + '(' + ', '.join(name + '=' + repr(value) for name, value in zip(self._fields, self)) + ')'
+        """Return a nicely formatted representation string"""
+        return self.__class__.__name__ + '(' + ', '.join(name + '=' + repr(value) for name, value in zip({tuple(fields)!r}, self)) + ')'
+    __new__.__func__.__module__ = 'namedtuple_{name}'
+    _make.__func__.__module__ = 'collections'
+    _replace.__module__ = 'collections'
+    _asdict.__module__ = 'collections'
+    __getnewargs__.__module__ = 'collections'
+    __repr__.__module__ = 'collections'
 {getters}
 '''
             body.extend(ast.parse(source).body)
