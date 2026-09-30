@@ -444,6 +444,80 @@ del readable_owner
 gc.collect()
 results['readable-cycle-collection'] = [owner_reference() is None, stream_reference() is None]
 
+release_events = []
+finalizer_stream = None
+def record_release(label):
+    release_events.append([label, 'released'])
+    if finalizer_stream is None:
+        return
+    for operation in ('next', 'throw'):
+        try:
+            if operation == 'next':
+                next(finalizer_stream)
+            else:
+                finalizer_stream.throw(RuntimeError('finalizer injection'))
+        except Exception as error:
+            release_events.append([label, operation, type(error).__name__, str(error)])
+class EphemeralReadableField:
+    write_only = False
+    def __del__(self):
+        record_release('field')
+class EphemeralReadableIterator:
+    def __init__(self):
+        self.done = False
+    def __iter__(self):
+        release_events.append(['iter'])
+        return self
+    def __next__(self):
+        if self.done:
+            raise StopIteration
+        self.done = True
+        return EphemeralReadableField()
+    def __del__(self):
+        record_release('iterator')
+class EphemeralReadableContainer:
+    def values(self):
+        release_events.append(['values'])
+        return EphemeralReadableIterator()
+    def __del__(self):
+        record_release('container')
+class EphemeralReadableOwner(serializers.Serializer):
+    @property
+    def fields(self):
+        return EphemeralReadableContainer()
+    def __del__(self):
+        record_release('owner')
+
+for operation in ('exhaust', 'close', 'throw', 'close-before-start', 'throw-before-start'):
+    release_events.clear()
+    finalizer_stream = EphemeralReadableOwner()._readable_fields
+    if not operation.endswith('before-start'):
+        next(finalizer_stream)
+    if operation == 'exhaust':
+        list(finalizer_stream)
+    elif operation.startswith('close'):
+        finalizer_stream.close()
+        try:
+            finalizer_stream.send(1)
+        except Exception as error:
+            release_events.append(['closed send', type(error).__name__, str(error)])
+    else:
+        try:
+            finalizer_stream.throw(RuntimeError('injected'))
+        except RuntimeError:
+            pass
+    results['readable-finalizers-' + operation] = list(release_events)
+    finalizer_stream = None
+    gc.collect()
+
+readable_owner = EphemeralReadableOwner()
+readable_owner.stream = readable_owner._readable_fields
+next(readable_owner.stream)
+owner_reference, stream_reference = weakref.ref(readable_owner), weakref.ref(readable_owner.stream)
+del readable_owner
+gc.collect()
+results['readable-suspended-cycle-collection'] = [owner_reference() is None, stream_reference() is None]
+
 from rest_framework.validators import UniqueValidator
 truth_events = []
 class TruthToken:

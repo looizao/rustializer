@@ -312,15 +312,12 @@ impl ReadableFields {
     pub(super) fn resume(&mut self, py: Python<'_>, frame: &mut Frame) -> PyResult<Option<Object>> {
         if self.iterator.is_none() {
             crate::warnings::mark(self.lines[0]);
-            self.iterator = Some(
-                frame
-                    .lookup(py, "self")?
-                    .bind(py)
-                    .getattr("fields")?
-                    .call_method0("values")?
-                    .try_iter()?
-                    .unbind(),
-            );
+            let values = {
+                let fields = frame.lookup(py, "self")?.bind(py).getattr("fields")?;
+                fields.call_method0("values")?
+            };
+            // CALL releases its receiver before GET_ITER invokes user code.
+            self.iterator = Some(values.try_iter()?.unbind());
         }
         loop {
             crate::warnings::mark(self.lines[0]);

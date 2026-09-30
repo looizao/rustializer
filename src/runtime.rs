@@ -55,6 +55,24 @@ fn s<'a>(n: &'a Node, key: &str) -> &'a str {
 fn array<'a>(n: &'a Node, key: &str) -> &'a [Node] {
     n[key].as_array().map(Vec::as_slice).unwrap_or(&[])
 }
+fn python_version() -> [u8; 2] {
+    static VERSION: std::sync::OnceLock<[u8; 2]> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let version = unsafe { std::ffi::CStr::from_ptr(pyo3::ffi::Py_GetVersion()) }.to_bytes();
+        let mut parts = version.split(|byte| *byte == b'.').skip(1);
+        std::array::from_fn(|_| {
+            parts
+                .next()
+                .unwrap_or_default()
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .fold(0, |number, byte| number * 10 + byte - b'0')
+        })
+    })
+}
+fn python_minor() -> u8 {
+    python_version()[0]
+}
 
 #[pyclass(subclass, dict, weakref, module = "rustializer._native")]
 pub struct EngineState;
@@ -469,6 +487,11 @@ impl EngineFunction {
         function.defaults = None;
         function.kw_defaults = None;
         if function.is_generator {
+            if matches!(function.plan, Some(fast::Plan::ReadableFields(_))) && python_minor() < 14 {
+                // This loop never calls zero-argument super(). Older CPython
+                // frames release self before field; don't retain another self.
+                frame.first = None;
+            }
             return Ok(Py::new(
                 py,
                 EngineGenerator {
@@ -481,6 +504,7 @@ impl EngineFunction {
                     },
                     running: false,
                     started: false,
+                    closed: false,
                 },
             )?
             .into_any());
@@ -1865,6 +1889,26 @@ struct EngineGenerator {
     tasks: Vec<Task>,
     running: bool,
     started: bool,
+    closed: bool,
+}
+fn release_generator(
+    slf: &Bound<'_, EngineGenerator>,
+    frame: Option<Frame>,
+    tasks: Vec<Task>,
+    closing: bool,
+) {
+    // CPython 3.13 close clears locals before its suspended iterator. Other
+    // releases unwind the iterator first. Never hold a Rust borrow over decref:
+    // application finalizers can call the generator again during cleanup.
+    if closing && python_minor() == 13 {
+        drop(frame);
+        drop(tasks);
+    } else {
+        drop(tasks);
+        slf.borrow_mut().running = false;
+        drop(frame);
+    }
+    slf.borrow_mut().running = false;
 }
 #[pymethods]
 impl EngineGenerator {
@@ -1880,6 +1924,9 @@ impl EngineGenerator {
                     "generator already executing",
                 ));
             }
+            if generator.closed {
+                return Ok(None);
+            }
             let Some(frame) = generator.frame.take() else {
                 return Ok(None);
             };
@@ -1894,6 +1941,8 @@ impl EngineGenerator {
         if matches!(&result, Ok(Some(_))) {
             generator.frame = Some(frame);
             generator.tasks = tasks;
+        } else {
+            generator.closed = true;
         }
         match result {
             Err(error) if error.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
@@ -1908,32 +1957,50 @@ impl EngineGenerator {
         }
     }
     fn send(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<Object> {
-        if slf.borrow().frame.is_some() && !slf.borrow().started && !value.is_none() {
+        if !slf.borrow().closed
+            && slf.borrow().frame.is_some()
+            && !slf.borrow().started
+            && !value.is_none()
+        {
             return Err(PyTypeError::new_err(
                 "can't send non-None value to a just-started generator",
             ));
         }
         Self::__next__(slf)?.ok_or_else(|| pyo3::exceptions::PyStopIteration::new_err(()))
     }
-    fn close(&mut self) -> PyResult<()> {
-        if self.running {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "generator already executing",
-            ));
-        }
-        self.frame = None;
-        self.tasks.clear();
+    fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let (frame, tasks) = {
+            let mut generator = slf.borrow_mut();
+            if generator.running {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "generator already executing",
+                ));
+            }
+            if generator.closed {
+                return Ok(());
+            }
+            generator.closed = true;
+            // 3.12 and 3.13 before 3.13.12 retain unstarted locals until
+            // deallocation; the later 3.13 patches explicitly clear the frame.
+            let [minor, patch] = python_version();
+            if !generator.started && (minor == 12 || minor == 13 && patch < 12) {
+                return Ok(());
+            }
+            generator.running = generator.started && matches!(python_minor(), 11 | 12);
+            (generator.frame.take(), std::mem::take(&mut generator.tasks))
+        };
+        release_generator(slf, frame, tasks, true);
         Ok(())
     }
     #[pyo3(signature=(typ, value=None, traceback=None))]
     fn throw(
-        &mut self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         typ: &Bound<'_, PyAny>,
         value: Option<&Bound<'_, PyAny>>,
         traceback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Object> {
-        if self.running {
+        let py = slf.py();
+        if slf.borrow().running {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "generator already executing",
             ));
@@ -1963,8 +2030,16 @@ impl EngineGenerator {
         if let Some(traceback) = traceback.filter(|v| !v.is_none()) {
             error.value(py).setattr("__traceback__", traceback)?;
         }
-        self.frame = None;
-        self.tasks.clear();
+        let (frame, tasks) = {
+            let mut generator = slf.borrow_mut();
+            if generator.closed {
+                return Err(error);
+            }
+            generator.closed = true;
+            generator.running = python_minor() > 10 && generator.started;
+            (generator.frame.take(), std::mem::take(&mut generator.tasks))
+        };
+        release_generator(slf, frame, tasks, false);
         Err(error)
     }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
@@ -1981,6 +2056,7 @@ impl EngineGenerator {
         Ok(())
     }
     fn __clear__(&mut self) {
+        self.closed = true;
         self.frame = None;
         self.tasks.clear();
     }
@@ -2126,6 +2202,7 @@ fn comprehension(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Object> {
             tasks: vec![Task::Comp(n.clone(), 0, first)],
             running: false,
             started: false,
+            closed: false,
         },
     )?;
     match op(n) {
