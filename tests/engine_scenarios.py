@@ -1,0 +1,236 @@
+"""Serializable differential observations, run unchanged against either engine."""
+import copy
+import datetime
+from decimal import Decimal
+import gc
+import inspect
+import json
+import pickle
+import sys
+import uuid
+import weakref
+
+if len(sys.argv) > 1 and sys.argv[1] == 'native':
+    import rustializer
+    rustializer.activate()
+
+from django.conf import settings
+settings.configure(
+    SECRET_KEY='differential', USE_I18N=False, USE_TZ=True,
+    INSTALLED_APPS=['django.contrib.contenttypes'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
+)
+import django
+django.setup()
+from django.db import connection, models
+from django.test.utils import CaptureQueriesContext
+from rest_framework import serializers
+from rest_framework.exceptions import ErrorDetail, ValidationError
+from rest_framework.utils.model_meta import RelationInfo
+
+
+def observe(value):
+    kind = f'{type(value).__module__}.{type(value).__qualname__}'
+    if isinstance(value, ErrorDetail):
+        return [kind, str(value), value.code]
+    if isinstance(value, dict):
+        return [kind, [[observe(k), observe(v)] for k, v in value.items()]]
+    if isinstance(value, (list, tuple)):
+        return [kind, [observe(item) for item in value]]
+    if isinstance(value, (datetime.date, datetime.time, Decimal, uuid.UUID)):
+        return [kind, str(value)]
+    if isinstance(value, bytes):
+        return [kind, value.hex()]
+    return [kind, value]
+
+
+results = {}
+events = []
+
+
+class HookField(serializers.CharField):
+    def bind(self, field_name, parent):
+        events.append(['bind', field_name])
+        super().bind(field_name, parent)
+
+    def to_internal_value(self, data):
+        events.append(['internal', data])
+        return super().to_internal_value(data)
+
+    def to_representation(self, value):
+        events.append(['representation', value])
+        return super().to_representation(value)
+
+
+class Common(serializers.Serializer):
+    text = HookField(max_length=8)
+    number = serializers.IntegerField(min_value=0, required=False, default=3)
+    nullable = serializers.CharField(allow_null=True, required=False)
+    hidden = serializers.HiddenField(default='secret')
+    amount = serializers.DecimalField(max_digits=8, decimal_places=2, required=False)
+
+    def validate_text(self, value):
+        events.append(['validate_text', value])
+        if value == 'bad':
+            raise serializers.ValidationError('bad text', code='custom')
+        return value.upper()
+
+    def validate(self, attrs):
+        events.append(['validate', dict(attrs)])
+        return attrs
+
+
+for index, data in enumerate((
+    {'text': ' hi ', 'number': '4', 'nullable': None, 'amount': '1.234'},
+    {'text': 'bad', 'number': '-1'}, {}, {'text': 'far too long'},
+)):
+    events.clear()
+    item = Common(data=data)
+    valid = item.is_valid()
+    results[f'validation-{index}'] = {
+        'valid': valid, 'values': observe(item.validated_data), 'errors': observe(item.errors),
+        'data': observe(item.data), 'events': observe(copy.deepcopy(events)),
+        'repr': repr(item),
+    }
+    if not valid:
+        try:
+            item.is_valid(raise_exception=True)
+        except ValidationError as error:
+            results[f'error-{index}'] = [observe(error.detail), observe(error.get_codes()), observe(error.get_full_details())]
+
+partial = Common(data={}, partial=True)
+partial.is_valid()
+results['partial'] = [observe(partial.validated_data), observe(partial.errors)]
+many = Common(data=[{'text': 'one'}, {'text': 'two'}], many=True)
+many.is_valid()
+results['many'] = [observe(many.data), observe(many.validated_data), observe(many.errors)]
+
+s = Common({'text': 'abc', 'number': 2})
+s.fields.pop('text')
+s.fields['extra'] = serializers.CharField(source='text')
+results['mutation'] = [observe(s.data), s.fields['extra'].field_name, s.fields['extra'].parent is s]
+
+
+class Left(serializers.Serializer):
+    shared = serializers.CharField(label='left')
+    left = serializers.IntegerField()
+
+
+class Right(serializers.Serializer):
+    shared = serializers.CharField(label='right')
+    right = serializers.IntegerField()
+
+
+class Combined(Left, Right):
+    left = None
+    last = serializers.CharField()
+
+
+combined = Combined()
+results['inheritance'] = [list(combined.fields), combined.fields['shared'].label]
+
+field = HookField(label={'nested': [1]}, validators=[lambda value: None])
+cloned = copy.deepcopy(field)
+results['deepcopy'] = [type(cloned).__name__, cloned.label == field.label,
+                       cloned.label is not field.label, cloned._kwargs['validators'] is field._kwargs['validators']]
+for key, value in [('default', serializers.CreateOnlyDefault(7)), ('record', RelationInfo(1, 2, 3, 4, 5, 6)),
+                   ('field', serializers.IntegerField(min_value=2)), ('detail', ErrorDetail('missing', 'required'))]:
+    restored = pickle.loads(pickle.dumps(value))
+    if key in ('default', 'field'):
+        results[f'pickle-{key}'] = [type(restored).__name__, observe(restored.__dict__ if key == 'default' else restored._kwargs)]
+    else:
+        results[f'pickle-{key}'] = observe(restored)
+
+for key, cls in [('dict', type(s.data)), ('list', type(many.data))]:
+    value = s.data if key == 'dict' else many.data
+    results[f'pickle-return-{key}'] = observe(pickle.loads(pickle.dumps(value)))
+
+cycle = Common()
+ref = weakref.ref(cycle)
+cycle.saved = cycle.to_representation
+cycle.cycle = cycle
+_ = cycle.fields
+cycle = None
+gc.collect()
+results['gc'] = ref() is None
+
+failure = RuntimeError('application callback')
+seen = []
+
+
+class FailureField(serializers.Field):
+    def to_representation(self, value):
+        seen.append(value)
+        raise failure
+
+
+class FailureSerializer(serializers.Serializer):
+    item = FailureField()
+
+
+try:
+    FailureSerializer({'item': 1}).data
+except RuntimeError as error:
+    results['exception-identity'] = [error is failure, seen]
+
+
+class Thing(models.Model):
+    name = models.CharField(max_length=20, unique=True)
+    count = models.IntegerField(default=0)
+    class Meta:
+        app_label = 'differential'
+
+
+class ThingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Thing
+        fields = '__all__'
+
+    def create(self, validated_data):
+        events.append(['create', dict(validated_data)])
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        events.append(['update', dict(validated_data)])
+        return super().update(instance, validated_data)
+
+
+with connection.schema_editor() as editor:
+    editor.create_model(Thing)
+events.clear()
+with CaptureQueriesContext(connection) as queries:
+    creator = ThingSerializer(data={'name': 'one', 'count': 1})
+    assert creator.is_valid(), creator.errors
+    instance = creator.save(count=2)
+    updater = ThingSerializer(instance, data={'count': 4}, partial=True)
+    assert updater.is_valid(), updater.errors
+    updater.save()
+    duplicate = ThingSerializer(data={'name': 'one'})
+    duplicate.is_valid()
+results['database'] = {
+    'rows': list(Thing.objects.values_list('id', 'name', 'count')),
+    'errors': observe(duplicate.errors), 'events': observe(events),
+    'query-types': [q['sql'].split()[0] for q in queries],
+    'data': observe(updater.data), 'fields': repr(ThingSerializer()),
+}
+
+results['signatures'] = {
+    name: str(inspect.signature(getattr(serializers.Field, name)))
+    for name in ('bind', '__init__', '__new__', 'run_validation', 'fail')
+}
+results['binding-errors'] = []
+for method, args, kwargs in (
+    (serializers.Field.bind, (), {}),
+    (serializers.Field.bind, (field,), {}),
+    (field.bind, (), {'unexpected': True}),
+    (field.bind, ('name', s, 3), {}),
+    (field.bind, ('name', s), {'field_name': 'duplicate'}),
+    (field.run_validation, (1, 2), {}),
+):
+    try:
+        method(*args, **kwargs)
+    except Exception as error:
+        results['binding-errors'].append([type(error).__name__, str(error)])
+
+print(json.dumps(results, sort_keys=True, default=str))

@@ -5,12 +5,14 @@ build-backend = "maturin"
 [project]
 name = "rustializer"
 version = "0.1.0"
-description = "Native DRF serializer engine feasibility experiments"
+description = "Native Rust serialization and validation engine for Django REST Framework"
 requires-python = ">=3.10"
+dependencies = ["djangorestframework>=3.17.2"]
 
 [tool.maturin]
-module-name = "rustializer._feasibility"
+module-name = "rustializer._native"
 python-source = "python"
+include = [{ path = "src/programs/LICENSE", format = ["sdist", "wheel"] }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

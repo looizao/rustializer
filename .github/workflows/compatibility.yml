@@ -1,0 +1,67 @@
+name: Native engine compatibility
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compatibility:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            python: '3.10 3.11 3.12 3.13 3.14 3.15'
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            python: '3.10 3.11 3.12 3.13 3.14 3.15'
+          - runner: macos-15-intel
+            architecture: x86_64
+            python: '3.10 3.11 3.12 3.13 3.14 3.15'
+          - runner: macos-15
+            architecture: aarch64
+            python: '3.10 3.11 3.12 3.13 3.14 3.15'
+          - runner: windows-2025
+            architecture: x86_64
+            python: '3.10 3.11 3.12 3.13 3.14 3.15'
+          - runner: windows-11-arm
+            architecture: aarch64
+            # Conventional native Windows ARM64 Python starts at 3.11.
+            python: '3.11 3.12 3.13 3.14 3.15'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v10
+      - name: Build one binary for this platform and architecture
+        run: |
+          case "$RUNNER_OS" in
+            Linux) request="cpython-3.12-linux-${{ matrix.architecture }}-gnu" ;;
+            macOS) request="cpython-3.12-macos-${{ matrix.architecture }}-none" ;;
+            Windows) request="cpython-3.12-windows-${{ matrix.architecture }}-none" ;;
+          esac
+          uv venv --python "$request" .build-env
+          uv pip install --python .build-env maturin abi3audit
+          uv run --python .build-env --no-project maturin build --release --out dist
+          uv run --python .build-env --no-project abi3audit --strict dist/*.whl
+          cargo clippy -- -D warnings
+          cargo fmt --check
+      - name: Test the same installed wheel across both pinned upstream matrices
+        run: |
+          uv run --python .build-env --no-project python scripts/check_compatibility.py dist/*.whl \
+            --python ${{ matrix.python }} --architecture ${{ matrix.architecture }} \
+            --jobs 2 --work-directory compatibility-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidence-${{ matrix.runner }}-${{ matrix.architecture }}
+          path: |
+            dist/*.whl
+            compatibility-results/**/*.log
+          retention-days: 14
