@@ -1,0 +1,7 @@
+[package]
+name = "rustializer"
+version = "0.1.0"
+edition = "2024"
+description = "Django REST Framework-inspired serialization and validation in Rust"
+
+[dependencies]
