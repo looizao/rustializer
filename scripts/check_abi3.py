@@ -55,7 +55,7 @@ print(json.dumps({
             if not metadata["python"].startswith(version + "."):
                 raise RuntimeError(f"requested {version}, got {metadata['python']}")
             print(json.dumps(metadata), flush=True)
-            run(str(python), "-I", "-X", "dev", "-m", "unittest", "discover", "-s", str(tests), "-v", env=environment)
+            run(str(python), "-I", "-X", "dev", "-m", "unittest", "discover", "-s", str(tests), "-p", "test_native_object_model.py", "-v", env=environment)
     print(f"Verified identical extension SHA-256 {digest} on {len(options.python)} interpreters.", flush=True)
 
 

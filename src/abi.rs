@@ -81,6 +81,8 @@ pub fn install_new(class: &Bound<'_, PyType>, definition: ffi::PyMethodDef) -> P
     class.setattr("__new__", static_method)
 }
 
+// C unsigned long is 32 bits on Windows and 64 bits on Unix.
+#[cfg_attr(target_os = "windows", allow(clippy::unnecessary_cast))]
 pub fn metaclass(py: Python<'_>, new: ffi::newfunc) -> PyResult<Bound<'_, PyType>> {
     let mut slots = [
         ffi::PyType_Slot {
