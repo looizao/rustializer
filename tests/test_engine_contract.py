@@ -36,6 +36,25 @@ assert not hasattr(serializers.Serializer.to_representation, '__code__')
 rustializer.activate()
 ''')
 
+    def test_activation_and_callbacks_under_aggressive_garbage_collection(self):
+        self.run_code("""
+import gc
+# Native objects can be traversed while CPython allocates their instance dict.
+gc.set_threshold(1, 1, 1)
+import rustializer
+rustializer.activate()
+from django.conf import settings
+settings.configure(USE_I18N=False)
+from rest_framework import serializers
+class Example(serializers.Serializer):
+    value = serializers.IntegerField()
+for _ in range(20):
+    item = Example(data={'value': '2'})
+    assert item.is_valid() and item.data == {'value': 2}
+    item.cycle = item.run_validation
+    gc.collect()
+""")
+
     def test_late_activation_rejected(self):
         self.run_code('''
 from rest_framework import serializers

@@ -233,4 +233,65 @@ for method, args, kwargs in (
     except Exception as error:
         results['binding-errors'].append([type(error).__name__, str(error)])
 
+# Public callable behavior, including saved methods and mutable defaults.
+from rest_framework.utils import timezone as drf_timezone, json as drf_json
+results['annotated-signature'] = str(inspect.signature(drf_timezone.datetime_ambiguous))
+results['wrapped-signature'] = str(inspect.signature(drf_json.dumps))
+method_field = serializers.IntegerField()
+saved_method = method_field.run_validation
+results['bound-methods'] = [saved_method == method_field.run_validation,
+    saved_method.__func__ is serializers.Field.run_validation,
+    pickle.loads(pickle.dumps(serializers.Field.bind)) is serializers.Field.bind]
+original_defaults = serializers.Field.run_validation.__defaults__
+try:
+    serializers.Field.run_validation.__defaults__ = (5,)
+    results['mutable-defaults'] = [saved_method(), str(inspect.signature(saved_method))]
+finally:
+    serializers.Field.run_validation.__defaults__ = original_defaults
+original_required = serializers.Field.__init__.__kwdefaults__['required']
+try:
+    serializers.Field.__init__.__kwdefaults__['required'] = False
+    results['mutable-keyword-defaults'] = serializers.IntegerField().required
+finally:
+    serializers.Field.__init__.__kwdefaults__['required'] = original_required
+
+handled = []
+class HandledDecimal(serializers.DecimalField):
+    def fail(self, key, **kwargs):
+        current = sys.exc_info()[1]
+        handled.append([key, type(current).__name__ if current else None])
+        return super().fail(key, **kwargs)
+try:
+    HandledDecimal(max_digits=4, decimal_places=2).run_validation('invalid')
+except ValidationError as error:
+    results['handled-exception'] = [handled, type(error.__context__).__name__,
+        error.__cause__ is None, error.__suppress_context__, sys.exc_info()[1] is error]
+
+import warnings
+from unittest.mock import patch
+with patch.object(warnings, 'warn') as warning_hook:
+    serializers.DecimalField(max_digits=4, decimal_places=2, min_value=1.0)
+    results['warning-hook'] = [[str(call.args[0]), sorted(call.kwargs)]
+        for call in warning_hook.call_args_list]
+
+results['generator-protocol'] = []
+for operation in ('send-before-start', 'send', 'close', 'throw'):
+    stream = iter(Common({'text': 'abc', 'number': 2}))
+    observed = []
+    try:
+        if operation == 'send-before-start':
+            stream.send(1)
+        else:
+            observed.append(type(next(stream)).__name__)
+            if operation == 'send':
+                observed.append(type(stream.send(123)).__name__)
+            elif operation == 'close':
+                observed.append(stream.close())
+                next(stream)
+            else:
+                stream.throw(RuntimeError('injected'))
+    except Exception as error:
+        observed.extend([type(error).__name__, str(error)])
+    results['generator-protocol'].append([operation, observed])
+
 print(json.dumps(results, sort_keys=True, default=str))

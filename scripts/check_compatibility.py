@@ -78,6 +78,7 @@ def main():
             run(['git', 'clone', '--filter=blob:none', '--no-checkout',
                  'https://github.com/encode/django-rest-framework.git', checkout], work / 'clone.log')
         references = {}
+        reference_wheels = {}
         for version in options.drf:
             source = work / f'drf-{version}'
             if not source.exists():
@@ -87,6 +88,11 @@ def main():
                 with tarfile.open(archive) as content:
                     content.extractall(source, filter='data')
             references[version] = source
+            distribution = work / f'reference-wheel-{version}'
+            distribution.mkdir(exist_ok=True)
+            run([options.uv, 'build', source, '--wheel', '--out-dir', distribution],
+                work / f'build-reference-{version}.log')
+            reference_wheels[version], = distribution.glob('*.whl')
         plugin = work / 'activation'
         plugin.mkdir(exist_ok=True)
         (plugin / 'rustializer_activation.py').write_text('import rustializer\nrustializer.activate()\n')
@@ -124,7 +130,7 @@ def main():
             run([options.uv, 'pip', 'install', '--python', python,
                  '--group', f'{source / "pyproject.toml"}:test',
                  '--group', f'{source / "pyproject.toml"}:optional',
-                 f'Django>={django},<{upper}', 'pillow', source, wheel], directory / 'install.log', env=environment)
+                 f'Django>={django},<{upper}', 'pillow', reference_wheels[drf], wheel], directory / 'install.log', env=environment)
             probe = subprocess.run([str(python), '-I', '-X', 'dev', '-c', PROBE], env=environment,
                                    check=True, text=True, capture_output=True)
             metadata = json.loads(probe.stdout)

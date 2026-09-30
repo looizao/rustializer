@@ -22,7 +22,7 @@ def lower(value):
     if isinstance(value, ast.AST):
         result = {'_node': type(value).__name__}
         result.update({name: lower(child) for name, child in ast.iter_fields(value)
-                       if name not in ('ctx', 'type_comment', 'returns', 'annotation')})
+                       if name not in ('ctx', 'type_comment')})
         if hasattr(value, 'lineno'):
             result['line'] = value.lineno
         return result

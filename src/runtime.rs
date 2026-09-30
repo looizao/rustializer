@@ -184,8 +184,9 @@ struct EngineFunction {
     globals: Option<Py<PyDict>>,
     closure: Option<Py<PyList>>,
     class_cell: Option<Py<PyList>>,
-    defaults: Vec<Object>,
-    kw_defaults: Vec<Option<Object>>,
+    defaults: Option<Py<PyTuple>>,
+    kw_defaults: Option<Py<PyDict>>,
+    annotations: Option<Py<PyDict>>,
     receiver: Option<Object>,
     underlying: Option<Object>,
     name: String,
@@ -213,12 +214,9 @@ impl EngineFunction {
             globals: self.globals.as_ref().map(|v| v.clone_ref(py)),
             closure: self.closure.as_ref().map(|v| v.clone_ref(py)),
             class_cell: self.class_cell.as_ref().map(|v| v.clone_ref(py)),
-            defaults: self.defaults.iter().map(|v| v.clone_ref(py)).collect(),
-            kw_defaults: self
-                .kw_defaults
-                .iter()
-                .map(|v| v.as_ref().map(|v| v.clone_ref(py)))
-                .collect(),
+            defaults: self.defaults.as_ref().map(|v| v.clone_ref(py)),
+            kw_defaults: self.kw_defaults.as_ref().map(|v| v.clone_ref(py)),
+            annotations: self.annotations.as_ref().map(|v| v.clone_ref(py)),
             receiver,
             underlying: self.underlying.as_ref().map(|v| v.clone_ref(py)),
             name: self.name.clone(),
@@ -233,6 +231,11 @@ impl EngineFunction {
         args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Frame> {
+        let defaults: Vec<_> = self
+            .defaults
+            .as_ref()
+            .map(|v| v.bind(py).iter().collect())
+            .unwrap_or_default();
         let globals = self
             .globals
             .as_ref()
@@ -301,13 +304,13 @@ impl EngineFunction {
             }
         }
         if positional.len() > names.len() && spec["vararg"].is_null() {
-            let minimum = names.len() - self.defaults.len();
+            let minimum = names.len().saturating_sub(defaults.len());
             let expected = if minimum == names.len() {
                 names.len().to_string()
             } else {
                 format!("from {minimum} to {}", names.len())
             };
-            let plural = if names.len() == 1 && self.defaults.is_empty() {
+            let plural = if names.len() == 1 && defaults.is_empty() {
                 ""
             } else {
                 "s"
@@ -343,11 +346,8 @@ impl EngineFunction {
         let mut missing = Vec::new();
         for (i, name) in names.iter().enumerate() {
             if !locals.contains(name)? {
-                if i + self.defaults.len() >= names.len() {
-                    locals.set_item(
-                        name,
-                        self.defaults[i + self.defaults.len() - names.len()].bind(py),
-                    )?;
+                if i + defaults.len() >= names.len() {
+                    locals.set_item(name, &defaults[i + defaults.len() - names.len()])?;
                 } else {
                     missing.push(*name);
                 }
@@ -357,11 +357,17 @@ impl EngineFunction {
             return Err(missing_arguments(&self.qualname, "positional", &missing));
         }
         missing.clear();
-        for (i, item) in array(spec, "kwonlyargs").iter().enumerate() {
+        for item in array(spec, "kwonlyargs") {
             let name = s(item, "arg");
             if !locals.contains(name)? {
-                if let Some(value) = &self.kw_defaults[i] {
-                    locals.set_item(name, value.bind(py))?;
+                if let Some(value) = self
+                    .kw_defaults
+                    .as_ref()
+                    .map(|v| v.bind(py).get_item(name))
+                    .transpose()?
+                    .flatten()
+                {
+                    locals.set_item(name, value)?;
                 } else {
                     missing.push(name);
                 }
@@ -400,9 +406,12 @@ impl EngineFunction {
         let Some(instance) = instance.filter(|v| !v.is_none()) else {
             return Ok(slf.clone().into_any().unbind());
         };
-        let mut copied = slf.borrow().copied(slf.py(), Some(instance.unbind()));
-        copied.underlying = Some(slf.clone().into_any().unbind());
-        Ok(Py::new(slf.py(), copied)?.into_any())
+        Ok(slf
+            .py()
+            .import("types")?
+            .getattr("MethodType")?
+            .call1((slf, instance))?
+            .unbind())
     }
     #[pyo3(signature = (*args, **kwargs))]
     fn __call__(
@@ -422,6 +431,7 @@ impl EngineFunction {
                     frame: Some(frame),
                     tasks: vec![Task::Block(array(&function.node, "body").to_vec(), 0)],
                     running: false,
+                    started: false,
                 },
             )?
             .into_any());
@@ -464,8 +474,13 @@ impl EngineFunction {
         self.module = value;
     }
     #[getter]
-    fn __self__(&self, py: Python<'_>) -> Option<Object> {
-        self.receiver.as_ref().map(|v| v.clone_ref(py))
+    fn __self__(&self, py: Python<'_>) -> PyResult<Object> {
+        self.receiver
+            .as_ref()
+            .map(|v| v.clone_ref(py))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyAttributeError::new_err("native function has no __self__")
+            })
     }
     #[getter]
     fn __func__(&self, py: Python<'_>) -> PyResult<Object> {
@@ -487,10 +502,47 @@ impl EngineFunction {
         self.doc = value;
     }
     #[getter]
-    fn __signature__(&self, py: Python<'_>) -> PyResult<Object> {
+    fn __defaults__(&self, py: Python<'_>) -> Option<Py<PyTuple>> {
+        self.defaults.as_ref().map(|v| v.clone_ref(py))
+    }
+    #[setter(__defaults__)]
+    fn set_defaults(&mut self, value: Option<Py<PyTuple>>) {
+        self.defaults = value;
+    }
+    #[getter]
+    fn __kwdefaults__(&self, py: Python<'_>) -> Option<Py<PyDict>> {
+        self.kw_defaults.as_ref().map(|v| v.clone_ref(py))
+    }
+    #[setter(__kwdefaults__)]
+    fn set_kwdefaults(&mut self, value: Option<Py<PyDict>>) {
+        self.kw_defaults = value;
+    }
+    #[getter]
+    fn __annotations__(&self, py: Python<'_>) -> Py<PyDict> {
+        self.annotations.as_ref().unwrap().clone_ref(py)
+    }
+    #[setter(__annotations__)]
+    fn set_annotations(&mut self, value: Py<PyDict>) {
+        self.annotations = Some(value);
+    }
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<Object> {
+        Ok(self.qualname.clone().into_pyobject(py)?.into_any().unbind())
+    }
+    #[getter]
+    fn __signature__(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Object> {
         let inspect = py.import("inspect")?;
+        if let Ok(wrapped) = slf.getattr("__wrapped__") {
+            return Ok(inspect.getattr("signature")?.call1((wrapped,))?.unbind());
+        }
+        let this = slf.borrow();
+        let self_ = &*this;
+        let defaults: Vec<_> = self_
+            .defaults
+            .as_ref()
+            .map(|v| v.bind(py).iter().collect())
+            .unwrap_or_default();
         let parameter = inspect.getattr("Parameter")?;
-        let spec = &self.node["args"];
+        let spec = &self_.node["args"];
         let mut parameters = Vec::new();
         let positional: Vec<_> = array(spec, "posonlyargs")
             .iter()
@@ -499,14 +551,20 @@ impl EngineFunction {
         for (i, node) in positional
             .iter()
             .enumerate()
-            .skip(usize::from(self.receiver.is_some()))
+            .skip(usize::from(self_.receiver.is_some()))
         {
             let kwargs = PyDict::new(py);
-            if i + self.defaults.len() >= positional.len() {
-                kwargs.set_item(
-                    "default",
-                    self.defaults[i + self.defaults.len() - positional.len()].bind(py),
-                )?;
+            if i + defaults.len() >= positional.len() {
+                kwargs.set_item("default", &defaults[i + defaults.len() - positional.len()])?;
+            }
+            if let Some(annotation) = self_
+                .annotations
+                .as_ref()
+                .unwrap()
+                .bind(py)
+                .get_item(s(node, "arg"))?
+            {
+                kwargs.set_item("annotation", annotation)?;
             }
             let kind = if i < array(spec, "posonlyargs").len() {
                 "POSITIONAL_ONLY"
@@ -522,10 +580,16 @@ impl EngineFunction {
                 parameter.getattr("VAR_POSITIONAL")?,
             ))?);
         }
-        for (i, node) in array(spec, "kwonlyargs").iter().enumerate() {
+        for node in array(spec, "kwonlyargs") {
             let kwargs = PyDict::new(py);
-            if let Some(value) = &self.kw_defaults[i] {
-                kwargs.set_item("default", value.bind(py))?;
+            if let Some(value) = self_
+                .kw_defaults
+                .as_ref()
+                .map(|v| v.bind(py).get_item(s(node, "arg")))
+                .transpose()?
+                .flatten()
+            {
+                kwargs.set_item("default", value)?;
             }
             parameters.push(parameter.call(
                 (s(node, "arg"), parameter.getattr("KEYWORD_ONLY")?),
@@ -537,7 +601,20 @@ impl EngineFunction {
                 parameter.call1((s(&spec["kwarg"], "arg"), parameter.getattr("VAR_KEYWORD")?))?,
             );
         }
-        Ok(inspect.getattr("Signature")?.call1((parameters,))?.unbind())
+        let kwargs = PyDict::new(py);
+        if let Some(annotation) = self_
+            .annotations
+            .as_ref()
+            .unwrap()
+            .bind(py)
+            .get_item("return")?
+        {
+            kwargs.set_item("return_annotation", annotation)?;
+        }
+        Ok(inspect
+            .getattr("Signature")?
+            .call((parameters,), Some(&kwargs))?
+            .unbind())
     }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.globals)?;
@@ -545,12 +622,9 @@ impl EngineFunction {
         visit.call(&self.class_cell)?;
         visit.call(&self.receiver)?;
         visit.call(&self.underlying)?;
-        for value in &self.defaults {
-            visit.call(value)?;
-        }
-        for value in &self.kw_defaults {
-            visit.call(value)?;
-        }
+        visit.call(&self.defaults)?;
+        visit.call(&self.kw_defaults)?;
+        visit.call(&self.annotations)?;
         Ok(())
     }
     fn __clear__(&mut self) {
@@ -559,8 +633,9 @@ impl EngineFunction {
         self.class_cell = None;
         self.receiver = None;
         self.underlying = None;
-        self.defaults.clear();
-        self.kw_defaults.clear();
+        self.defaults = None;
+        self.kw_defaults = None;
+        self.annotations = None;
     }
 }
 fn contains_yield(node: &Node, root: bool) -> bool {
@@ -645,16 +720,41 @@ fn function(py: Python<'_>, frame: &mut Frame, node: &Node, in_class: bool) -> P
         .iter()
         .map(|n| eval(py, frame, n))
         .collect::<PyResult<Vec<_>>>()?;
-    let kw_defaults = array(&node["args"], "kw_defaults")
+    let defaults = if defaults.is_empty() {
+        None
+    } else {
+        Some(PyTuple::new(py, defaults)?.unbind())
+    };
+    let kw_defaults = PyDict::new(py);
+    for (argument, value) in array(&node["args"], "kwonlyargs")
         .iter()
-        .map(|n| {
-            if n.is_null() {
-                Ok(None)
-            } else {
-                eval(py, frame, n).map(Some)
-            }
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+        .zip(array(&node["args"], "kw_defaults"))
+    {
+        if !value.is_null() {
+            kw_defaults.set_item(s(argument, "arg"), eval(py, frame, value)?)?;
+        }
+    }
+    let kw_defaults = if kw_defaults.is_empty() {
+        None
+    } else {
+        Some(kw_defaults.unbind())
+    };
+    let annotations = PyDict::new(py);
+    for argument in array(&node["args"], "posonlyargs")
+        .iter()
+        .chain(array(&node["args"], "args"))
+        .chain(array(&node["args"], "kwonlyargs"))
+    {
+        if !argument["annotation"].is_null() {
+            annotations.set_item(
+                s(argument, "arg"),
+                eval(py, frame, &argument["annotation"])?,
+            )?;
+        }
+    }
+    if !node["returns"].is_null() {
+        annotations.set_item("return", eval(py, frame, &node["returns"])?)?;
+    }
     let module = frame
         .globals
         .bind(py)
@@ -681,6 +781,7 @@ fn function(py: Python<'_>, frame: &mut Frame, node: &Node, in_class: bool) -> P
             class_cell: frame.class_cell.as_ref().map(|v| v.clone_ref(py)),
             defaults,
             kw_defaults,
+            annotations: Some(annotations.unbind()),
             receiver: None,
             underlying: None,
             doc: array(node, "body")
@@ -967,6 +1068,14 @@ fn eval(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Object> {
                 && op(&n["func"]["value"]) == "Name"
                 && s(&n["func"]["value"], "id") == "warnings"
                 && s(&n["func"], "attr") == "warn"
+                && callable
+                    .bind(py)
+                    .is_instance_of::<pyo3::types::PyCFunction>()
+                && callable
+                    .bind(py)
+                    .getattr("__module__")?
+                    .extract::<String>()?
+                    == "_warnings"
             {
                 return crate::warnings::warn(py, &args, &kwargs);
             }
@@ -1172,6 +1281,14 @@ fn statement(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Flow> {
                 value
             };
             let error = PyErr::from_value(exception.bind(py).clone());
+            let context = py
+                .import("sys")?
+                .getattr("exc_info")?
+                .call0()?
+                .get_item(1)?;
+            if !context.is_none() && !error.value(py).is(&context) {
+                error.value(py).setattr("__context__", context)?;
+            }
             if !n["cause"].is_null() {
                 let value = eval(py, f, &n["cause"])?;
                 let cause = if value.bind(py).is_none() {
@@ -1224,6 +1341,10 @@ fn statement(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Flow> {
             if let Err(error) = &result {
                 f.exception = Some(error.clone_ref(py));
             }
+            let _handled = f
+                .exception
+                .as_ref()
+                .map(|error| HandledException::enter(py, error));
             match block(py, f, array(n, "finalbody")) {
                 Ok(Flow::Next) => {}
                 other => result = other,
@@ -1457,6 +1578,7 @@ struct EngineGenerator {
     frame: Option<Frame>,
     tasks: Vec<Task>,
     running: bool,
+    started: bool,
 }
 #[pymethods]
 impl EngineGenerator {
@@ -1476,6 +1598,7 @@ impl EngineGenerator {
                 return Ok(None);
             };
             generator.running = true;
+            generator.started = true;
             (frame, std::mem::take(&mut generator.tasks))
         };
         let _context = crate::warnings::Context::enter(py, frame.globals.bind(py), 1)?;
@@ -1486,7 +1609,77 @@ impl EngineGenerator {
             generator.frame = Some(frame);
             generator.tasks = tasks;
         }
-        result
+        match result {
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                let replacement = PyRuntimeError::new_err("generator raised StopIteration");
+                replacement
+                    .value(py)
+                    .setattr("__context__", error.value(py))?;
+                replacement.set_cause(py, Some(error));
+                Err(replacement)
+            }
+            other => other,
+        }
+    }
+    fn send(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<Object> {
+        if slf.borrow().frame.is_some() && !slf.borrow().started && !value.is_none() {
+            return Err(PyTypeError::new_err(
+                "can't send non-None value to a just-started generator",
+            ));
+        }
+        Self::__next__(slf)?.ok_or_else(|| pyo3::exceptions::PyStopIteration::new_err(()))
+    }
+    fn close(&mut self) -> PyResult<()> {
+        if self.running {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "generator already executing",
+            ));
+        }
+        self.frame = None;
+        self.tasks.clear();
+        Ok(())
+    }
+    #[pyo3(signature=(typ, value=None, traceback=None))]
+    fn throw(
+        &mut self,
+        py: Python<'_>,
+        typ: &Bound<'_, PyAny>,
+        value: Option<&Bound<'_, PyAny>>,
+        traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Object> {
+        if self.running {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "generator already executing",
+            ));
+        }
+        let error = if typ.is_instance_of::<PyType>() {
+            let value = value.filter(|v| !v.is_none());
+            let exception = if let Some(value) = value {
+                if value.is_instance(typ)? {
+                    value.clone()
+                } else if let Ok(args) = value.cast::<PyTuple>() {
+                    typ.call(args, None)?
+                } else {
+                    typ.call1((value,))?
+                }
+            } else {
+                typ.call0()?
+            };
+            PyErr::from_value(exception)
+        } else {
+            if value.is_some_and(|v| !v.is_none()) {
+                return Err(PyTypeError::new_err(
+                    "instance exception may not have a separate value",
+                ));
+            }
+            PyErr::from_value(typ.clone())
+        };
+        if let Some(traceback) = traceback.filter(|v| !v.is_none()) {
+            error.value(py).setattr("__traceback__", traceback)?;
+        }
+        self.frame = None;
+        self.tasks.clear();
+        Err(error)
     }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(frame) = &self.frame {
@@ -1638,6 +1831,7 @@ fn comprehension(py: Python<'_>, f: &mut Frame, n: &Node) -> PyResult<Object> {
             frame: Some(frame),
             tasks: vec![Task::Comp(n.clone(), 0, first)],
             running: false,
+            started: false,
         },
     )?;
     match op(n) {
