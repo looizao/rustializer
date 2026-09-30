@@ -315,6 +315,135 @@ for operation in ('send-before-start', 'send', 'close', 'throw'):
         observed.extend([type(error).__name__, str(error)])
     results['generator-protocol'].append([operation, observed])
 
+# Readable fields are lazy generators over one live values iterator. Hooks can
+# replace the container or change a later field's visibility between yields.
+readable_events = []
+class ReadableFlag:
+    def __init__(self, field):
+        self.field = field
+    def __bool__(self):
+        readable_events.append(['truth', self.field.name, self.field.hidden])
+        return self.field.hidden
+class ReadableField:
+    def __init__(self, name, hidden=False):
+        self.name, self.hidden = name, hidden
+    @property
+    def write_only(self):
+        readable_events.append(['flag', self.name])
+        return ReadableFlag(self)
+class ReadableIterator:
+    def __init__(self, fields):
+        self.items = iter(fields)
+    def __iter__(self):
+        return self
+    def __getattribute__(self, name):
+        if name == '__next__':
+            raise AssertionError('iteration must use the iterator slot')
+        return object.__getattribute__(self, name)
+    def __next__(self):
+        readable_events.append(['next'])
+        return next(self.items)
+class ReadableContainer:
+    def __init__(self, fields):
+        self.items = fields
+    def values(self):
+        readable_events.append(['values'])
+        return ReadableIterator(self.items)
+class ReadableSerializer(serializers.Serializer):
+    @property
+    def fields(self):
+        readable_events.append(['fields'])
+        return self.container
+
+readable_owner = ReadableSerializer()
+first, second, third = [ReadableField(name) for name in ('first', 'second', 'third')]
+readable_owner.container = ReadableContainer([first, second, third])
+readable_stream = readable_owner._readable_fields
+results['readable-lazy-creation'] = list(readable_events)
+readable_names = [next(readable_stream).name]
+second.hidden = True
+readable_owner.container = ReadableContainer([ReadableField('replacement')])
+readable_names.append(readable_stream.send(123).name)
+readable_names.extend(field.name for field in readable_stream)
+results['readable-live-iteration'] = [readable_names, list(readable_events)]
+
+results['readable-generator-protocol'] = []
+for operation in ('send-before-start', 'send', 'close-before-start', 'close', 'throw'):
+    readable_events.clear()
+    readable_owner.container = ReadableContainer([ReadableField('one'), ReadableField('two')])
+    readable_stream = readable_owner._readable_fields
+    observed = []
+    failure = RuntimeError('readable injection')
+    try:
+        if operation == 'send-before-start':
+            readable_stream.send(1)
+        elif operation == 'close-before-start':
+            observed.append(readable_stream.close())
+            next(readable_stream)
+        else:
+            observed.append(next(readable_stream).name)
+            if operation == 'send':
+                observed.append(readable_stream.send(123).name)
+            elif operation == 'close':
+                observed.append(readable_stream.close())
+                next(readable_stream)
+            else:
+                readable_stream.throw(failure)
+    except Exception as error:
+        observed.extend([type(error).__name__, str(error), error is failure])
+    results['readable-generator-protocol'].append([operation, observed, list(readable_events)])
+
+class ReentrantReadableField(ReadableField):
+    @property
+    def write_only(self):
+        for operation in ('next', 'close', 'throw'):
+            try:
+                if operation == 'next':
+                    next(readable_stream)
+                elif operation == 'close':
+                    readable_stream.close()
+                else:
+                    readable_stream.throw(RuntimeError('reentrant'))
+            except Exception as error:
+                readable_events.append([operation, type(error).__name__, str(error)])
+        return False
+readable_events.clear()
+readable_owner.container = ReadableContainer([ReentrantReadableField('reentrant')])
+readable_stream = readable_owner._readable_fields
+results['readable-reentry'] = [next(readable_stream).name, list(readable_events)]
+readable_stream.close()
+
+class FailingReadableField(ReadableField):
+    @property
+    def write_only(self):
+        raise StopIteration('flag failure')
+readable_owner.container = ReadableContainer([FailingReadableField('failure')])
+readable_stream = readable_owner._readable_fields
+try:
+    next(readable_stream)
+except Exception as error:
+    results['readable-stop-iteration'] = [type(error).__name__, str(error),
+        type(error.__cause__).__name__, str(error.__cause__), error.__suppress_context__]
+results['readable-closed-after-failure'] = list(readable_stream)
+
+readable_owner = serializers.Serializer()
+readable_owner.fields['one'] = serializers.CharField()
+readable_owner.fields['two'] = serializers.CharField()
+readable_stream = readable_owner._readable_fields
+next(readable_stream)
+readable_owner.fields.pop('two')
+try:
+    next(readable_stream)
+except Exception as error:
+    results['readable-container-size-mutation'] = [type(error).__name__, str(error)]
+
+readable_owner = serializers.Serializer()
+readable_owner.stream = readable_owner._readable_fields
+owner_reference, stream_reference = weakref.ref(readable_owner), weakref.ref(readable_owner.stream)
+del readable_owner
+gc.collect()
+results['readable-cycle-collection'] = [owner_reference() is None, stream_reference() is None]
+
 from rest_framework.validators import UniqueValidator
 truth_events = []
 class TruthToken:

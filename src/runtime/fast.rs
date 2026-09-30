@@ -7,6 +7,7 @@ pub(super) enum Plan {
     Scalar(&'static str, u32),
     FieldValidation([u32; 3]),
     SerializerRepresentation([u32; 3]),
+    ReadableFields([u32; 3]),
     ListRepresentation([u32; 2]),
     SimpleCallable(usize, u32),
     FieldAttribute(usize, u32),
@@ -55,6 +56,16 @@ impl Plan {
                     site(node, "to_representation"),
                 ]))
             }
+            ("rest_framework.serializers", "Serializer._readable_fields") => {
+                let loop_node = array(node, "body").first()?;
+                let filter = array(loop_node, "body").first()?;
+                let emit = array(filter, "body").first()?;
+                Some(Self::ReadableFields([
+                    site(node, "values"),
+                    site(node, "write_only"),
+                    emit["line"].as_u64().unwrap_or(1) as u32,
+                ]))
+            }
             ("rest_framework.serializers", "ListSerializer.to_representation") => {
                 Some(Self::ListRepresentation([
                     site(node, "all"),
@@ -93,6 +104,9 @@ impl Plan {
         node: &Node,
     ) -> PyResult<Object> {
         match self {
+            Self::ReadableFields(_) => Err(PyRuntimeError::new_err(
+                "readable fields must execute as a generator",
+            )),
             Self::FieldAttribute(index, line) => {
                 crate::warnings::mark(*line);
                 let callable = frame.lookup(py, "get_attribute")?;
@@ -275,6 +289,50 @@ impl Plan {
                     result.append(child.call_method1("to_representation", (item,))?)?;
                 }
                 Ok(result.into_any().unbind())
+            }
+        }
+    }
+}
+
+// Keep the ordinary generator frame and protocol, replacing only the fixed
+// loop's AST copies. The values view is created on first resume and retained
+// across yields. Both the field and its write_only flag stay live.
+pub(super) struct ReadableFields {
+    pub(super) iterator: Option<Py<pyo3::types::PyIterator>>,
+    lines: [u32; 3],
+}
+impl ReadableFields {
+    pub(super) fn new(lines: [u32; 3]) -> Self {
+        Self {
+            iterator: None,
+            lines,
+        }
+    }
+
+    pub(super) fn resume(&mut self, py: Python<'_>, frame: &mut Frame) -> PyResult<Option<Object>> {
+        if self.iterator.is_none() {
+            crate::warnings::mark(self.lines[0]);
+            self.iterator = Some(
+                frame
+                    .lookup(py, "self")?
+                    .bind(py)
+                    .getattr("fields")?
+                    .call_method0("values")?
+                    .try_iter()?
+                    .unbind(),
+            );
+        }
+        loop {
+            crate::warnings::mark(self.lines[0]);
+            let Some(field) = self.iterator.as_ref().unwrap().bind(py).clone().next() else {
+                return Ok(None);
+            };
+            let field = field?;
+            frame.locals.bind(py).set_item("field", &field)?;
+            crate::warnings::mark(self.lines[1]);
+            if !field.getattr("write_only")?.is_truthy()? {
+                crate::warnings::mark(self.lines[2]);
+                return Ok(Some(field.unbind()));
             }
         }
     }

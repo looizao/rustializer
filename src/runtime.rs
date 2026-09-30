@@ -473,7 +473,12 @@ impl EngineFunction {
                 py,
                 EngineGenerator {
                     frame: Some(frame),
-                    tasks: vec![Task::Block(array(&function.node, "body").to_vec(), 0)],
+                    tasks: match &function.plan {
+                        Some(fast::Plan::ReadableFields(lines)) => {
+                            vec![Task::ReadableFields(fast::ReadableFields::new(*lines))]
+                        }
+                        _ => vec![Task::Block(array(&function.node, "body").to_vec(), 0)],
+                    },
                     running: false,
                     started: false,
                 },
@@ -1847,6 +1852,7 @@ unsafe extern "C" fn engine_metaclass_new(
 // Suspension is held in native iterator objects. Yielding functions and
 // generator expressions keep their Python values alive and are GC traversable.
 enum Task {
+    ReadableFields(fast::ReadableFields),
     Block(Vec<Node>, usize),
     For(Node, Object),
     While(Node),
@@ -1967,6 +1973,7 @@ impl EngineGenerator {
         }
         for task in &self.tasks {
             match task {
+                Task::ReadableFields(fields) => visit.call(&fields.iterator)?,
                 Task::For(_, v) | Task::Comp(_, _, v) => visit.call(v)?,
                 _ => {}
             }
@@ -1981,6 +1988,13 @@ impl EngineGenerator {
 fn resume(py: Python<'_>, f: &mut Frame, tasks: &mut Vec<Task>) -> PyResult<Option<Object>> {
     while let Some(task) = tasks.pop() {
         match task {
+            Task::ReadableFields(mut fields) => {
+                let next = fields.resume(py, f)?;
+                if next.is_some() {
+                    tasks.push(Task::ReadableFields(fields));
+                }
+                return Ok(next);
+            }
             Task::Block(nodes, index) => {
                 let Some(n) = nodes.get(index).cloned() else {
                     continue;
