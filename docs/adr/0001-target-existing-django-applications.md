@@ -1,0 +1,11 @@
+# Target existing Django applications
+
+Rustializer will target existing Python/Django applications as a drop-in replacement for DRF's serialization engine, enabled through one explicit activation step with unchanged serializer definitions and imports. We chose this over a standalone Rust-native serializer API because the intended users should be able to adopt Rustializer in existing projects while preserving full existing behavior, including input validation, model serializers, custom hooks, and persistence behavior.
+
+Initial compatibility will cover DRF 3.17.2, used by the Mayo application, and the local DRF checkout at commit `b578eab1cad040414b758131af1e17aa000b51e2`, which reports version 3.18.1. Supporting newer revisions is an intended ongoing activity, with tests establishing compatibility for each upgrade rather than assuming it from a version label. Each baseline will be tested against its own full numbered upstream tox matrix on conventional CPython builds.
+
+For DRF 3.17.2, the matrix is Python 3.10 and 3.11 with Django 4.2, 5.1, and 5.2; Python 3.12 with Django 4.2, 5.1, 5.2, and 6.0; Python 3.13 with Django 5.1, 5.2, and 6.0; and Python 3.14 with Django 5.2 and 6.0. The 3.17.2 reference tag resolves to commit `ad309f3e18aa5591db87a8fc959dc4564c000324`.
+
+For the pinned 3.18.1 checkout, the matrix is Python 3.10 and 3.11 with Django 5.2; Python 3.12, 3.13, and 3.14 with Django 5.2, 6.0, and 6.1; and Python 3.15 with Django 6.1. Platform support will include Linux, macOS, and Windows, with x86_64 and ARM64 targets where the selected Python versions support them. Free-threaded CPython, PyPy, and moving Django development branches are outside the initial release commitment.
+
+Full behavioral compatibility comes before performance optimization. After compatibility is established, Rustializer will track performance characteristics broadly and seek to improve every characteristic as much as possible. Evaluation will include representative benchmarks and the `mayo-eh-api` application's serializer workload, using an isolated copy of `/home/looizao/cactus/mayo-eh-api` while leaving the original clone unchanged. Detailed performance measurement and optimization work follows the compatibility milestone rather than defining a universal improvement requirement for the first compatible engine.
