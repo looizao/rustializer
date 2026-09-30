@@ -55,9 +55,24 @@ jobs:
           uv run --python .build-env --no-project abi3audit --strict dist/*.whl
           cargo clippy -- -D warnings
           cargo fmt --check
+      - name: Build native libpq for Windows ARM64
+        if: runner.os == 'Windows' && matrix.architecture == 'aarch64'
+        shell: pwsh
+        run: |
+          $portRoot = Join-Path $env:RUNNER_TEMP 'native-libpq-vcpkg'
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git $portRoot
+          git -C $portRoot checkout 4cb050be2cfa7a947cdd2dd1a70e24b17774c979
+          & "$portRoot/bootstrap-vcpkg.bat" -disableMetrics
+          & "$portRoot/vcpkg.exe" install 'libpq[core]:arm64-windows' --binarysource=clear
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$portRoot/installed/arm64-windows/bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Test the same installed wheel across both pinned upstream matrices
         run: |
-          uv run --python .build-env --no-project python scripts/check_compatibility.py dist/*.whl \
+          dependency_flags=()
+          if [[ "$RUNNER_OS" == Windows && "${{ matrix.architecture }}" == aarch64 ]]; then
+            dependency_flags=(--psycopg python)
+          fi
+          uv run --python .build-env --no-project python scripts/check_compatibility.py dist/*.whl "${dependency_flags[@]}" \
             --python ${{ matrix.python }} --architecture ${{ matrix.architecture }} \
             --jobs 2 --work-directory compatibility-results
       - uses: actions/upload-artifact@v4

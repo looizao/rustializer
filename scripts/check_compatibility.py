@@ -44,7 +44,7 @@ def run(command, log, *, cwd=None, env=None):
         result = subprocess.run([str(arg) for arg in command], cwd=cwd, env=env,
                                 stdout=output, stderr=subprocess.STDOUT)
     if result.returncode:
-        tail = '\n'.join(log.read_text(errors='replace').splitlines()[-45:])
+        tail = '\n'.join(log.read_text(errors='replace').splitlines()[-25:])[-6000:]
         raise RuntimeError(f'{command[0]} exited {result.returncode}; {log}\n{tail}')
     return time.monotonic() - start
 
@@ -60,6 +60,8 @@ def main():
     parser.add_argument('--work-directory', type=Path)
     parser.add_argument('--uv', default='uv')
     parser.add_argument('--architecture', choices=('x86_64', 'aarch64'))
+    parser.add_argument('--psycopg', choices=('binary', 'python'), default='binary',
+                        help='use pure psycopg with a native system libpq when binary wheels are unavailable')
     parser.add_argument('--no-baseline', action='store_true')
     options = parser.parse_args()
     wheel = options.wheel.resolve(strict=True)
@@ -127,13 +129,22 @@ def main():
             source = references[drf]
             major, minor = map(int, django.split('.'))
             upper = f'{major}.{minor + 1}'
+            optional = ['--group', f'{source / "pyproject.toml"}:optional']
+            if options.psycopg == 'python':
+                import tomllib
+                groups = tomllib.loads((source / 'pyproject.toml').read_text())['dependency-groups']
+                # Keep upstream source/tests untouched. Only select the documented
+                # pure installation of psycopg, with the same version constraint.
+                optional = [requirement.replace('psycopg[binary]', 'psycopg')
+                            for requirement in groups['optional']]
+                environment['PSYCOPG_IMPL'] = 'python'
             run([options.uv, 'pip', 'install', '--python', python,
-                 '--group', f'{source / "pyproject.toml"}:test',
-                 '--group', f'{source / "pyproject.toml"}:optional',
+                 '--group', f'{source / "pyproject.toml"}:test', *optional,
                  f'Django>={django},<{upper}', 'pillow', reference_wheels[drf], wheel], directory / 'install.log', env=environment)
             probe = subprocess.run([str(python), '-I', '-X', 'dev', '-c', PROBE], env=environment,
                                    check=True, text=True, capture_output=True)
             metadata = json.loads(probe.stdout)
+            metadata['psycopg_installation'] = options.psycopg
             if metadata['binary_sha256'] != digest or metadata['reference'] != REFERENCES[drf]:
                 raise RuntimeError(f'binary or source reference mismatch: {metadata}')
             if not metadata['python'].startswith(version + '.') or not metadata['django'].startswith(django + '.'):
